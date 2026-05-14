@@ -450,22 +450,25 @@ async function runPhaseLint(brainDir: string, dryRun: boolean): Promise<PhaseRes
     const { runLintCore } = await import('../commands/lint.ts');
     const result = await runLintCore({ target: brainDir, fix: true, dryRun });
     const issues = result.total_issues ?? 0;
+    const fixable = result.total_fixable ?? 0;
     const fixed = result.total_fixed ?? 0;
-    const remaining = Math.max(0, issues - fixed);
+    const remainingFixable = Math.max(0, fixable - fixed);
+    const legacyFindings = Math.max(0, issues - fixable);
     // 'ok' when nothing noteworthy remains:
     //   - no issues at all, or
     //   - non-dry-run and everything fixable was fixed.
-    // 'warn' when issues remain after the run.
+    // Historical unfixable lint findings are accepted as legacy debt here;
+    // the nightly cycle should warn only when deterministic fixes remain.
     const status: PhaseStatus =
-      issues === 0 || (!dryRun && remaining === 0) ? 'ok' : 'warn';
+      issues === 0 || (!dryRun && remainingFixable === 0) ? 'ok' : 'warn';
     return {
       phase: 'lint',
       status,
       duration_ms: 0, // set by caller
       summary: dryRun
-        ? `${issues} issue(s) found (dry-run, no writes)`
-        : `${fixed} fix(es) applied, ${remaining} remaining`,
-      details: { issues, fixed, pages_scanned: result.pages_scanned, dryRun },
+        ? `${issues} issue(s) found (${fixable} fixable; dry-run, no writes)`
+        : `${fixed} fix(es) applied, ${remainingFixable} fixable remaining (${legacyFindings} legacy finding(s) accepted)`,
+      details: { issues, fixable, fixed, legacyFindings, pages_scanned: result.pages_scanned, dryRun },
     };
   } catch (e) {
     return {

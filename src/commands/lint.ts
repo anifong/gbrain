@@ -19,6 +19,7 @@
 import { readFileSync, writeFileSync, readdirSync, statSync, lstatSync, existsSync } from 'fs';
 import { join, relative } from 'path';
 import { parseMarkdown, type ParseValidationCode } from '../core/markdown.ts';
+import { autoFixFrontmatter } from '../core/brain-writer.ts';
 
 export interface LintIssue {
   file: string;
@@ -95,8 +96,10 @@ export function lintContent(content: string, filePath: string): LintIssue[] {
     }
   }
 
-  // Rule: Wrapping code fences (```markdown ... ```)
-  if (content.match(/^```(?:markdown|md)\s*\n/m) && content.match(/\n```\s*$/m)) {
+  // Rule: Wrapping code fences (```markdown ... ```) around the entire page.
+  // Internal code examples are fine and should not be flagged.
+  const trimmedContent = content.trim();
+  if (/^```(?:markdown|md)\s*\n/.test(trimmedContent) && /\n```\s*$/.test(trimmedContent)) {
     issues.push({
       file: filePath, line: 1, rule: 'code-fence-wrap',
       message: 'Page wrapped in ```markdown code fences (LLM artifact)',
@@ -186,23 +189,38 @@ export function lintContent(content: string, filePath: string): LintIssue[] {
 }
 
 /** Auto-fix fixable issues */
-export function fixContent(content: string): string {
+export function fixContent(content: string, filePath?: string): string {
+  return fixContentWithCount(content, filePath).content;
+}
+
+function fixContentWithCount(content: string, filePath?: string): FixResult {
   let fixed = content;
+  let fixedCount = 0;
 
   // Fix LLM preambles
   for (const pattern of LLM_PREAMBLES) {
     pattern.lastIndex = 0;
-    fixed = fixed.replace(pattern, '');
+    fixed = fixed.replace(pattern, (...args) => {
+      const match = args[0] as string;
+      if (match.length > 0) fixedCount++;
+      return '';
+    });
   }
 
   // Fix wrapping code fences
+  const beforeFence = fixed;
   fixed = fixed.replace(/^```(?:markdown|md)\s*\n/, '');
   fixed = fixed.replace(/\n```\s*$/, '');
+  if (fixed !== beforeFence) fixedCount++;
+
+  const frontmatterFixed = autoFixFrontmatter(fixed, filePath ? { filePath } : undefined);
+  fixed = frontmatterFixed.content;
+  fixedCount += frontmatterFixed.fixes.length;
 
   // Clean up excessive blank lines left by fixes
   fixed = fixed.replace(/\n{3,}/g, '\n\n');
 
-  return fixed.trim() + '\n';
+  return { content: fixed.trim() + '\n', fixedCount };
 }
 
 /** Collect markdown files from a directory */
@@ -230,9 +248,15 @@ export interface LintResult {
   pages_scanned: number;
   pages_with_issues: number;
   total_issues: number;
+  total_fixable: number;
   total_fixed: number;
   dryRun: boolean;
   applied_fix: boolean;
+}
+
+interface FixResult {
+  content: string;
+  fixedCount: number;
 }
 
 /**
@@ -253,6 +277,7 @@ export async function runLintCore(opts: LintOpts): Promise<LintResult> {
   const pages = isSingleFile ? [opts.target] : collectPages(opts.target);
 
   let totalIssues = 0;
+  let totalFixable = 0;
   let totalFixed = 0;
   let pagesWithIssues = 0;
 
@@ -262,14 +287,14 @@ export async function runLintCore(opts: LintOpts): Promise<LintResult> {
     if (issues.length === 0) continue;
     pagesWithIssues++;
     totalIssues += issues.length;
+    totalFixable += issues.filter(i => i.fixable).length;
 
     if (opts.fix && issues.some(i => i.fixable)) {
-      const fixed = fixContent(content);
-      if (fixed !== content) {
-        const fixCount = issues.filter(i => i.fixable).length;
-        totalFixed += fixCount;
+      const fix = fixContentWithCount(content, page);
+      if (fix.content !== content) {
+        totalFixed += fix.fixedCount;
         if (!opts.dryRun) {
-          writeFileSync(page, fixed);
+          writeFileSync(page, fix.content);
         }
       }
     }
@@ -279,6 +304,7 @@ export async function runLintCore(opts: LintOpts): Promise<LintResult> {
     pages_scanned: pages.length,
     pages_with_issues: pagesWithIssues,
     total_issues: totalIssues,
+    total_fixable: totalFixable,
     total_fixed: totalFixed,
     dryRun: !!opts.dryRun,
     applied_fix: !!opts.fix,
@@ -312,6 +338,7 @@ export async function runLint(args: string[]) {
   const { getCliOptions, cliOptsToProgressOptions } = await import('../core/cli-options.ts');
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
   progress.start('lint.pages', pages.length);
+  let cliFixed = 0;
 
   for (const page of pages) {
     const content = readFileSync(page, 'utf-8');
@@ -327,25 +354,26 @@ export async function runLint(args: string[]) {
     }
 
     if (doFix && issues.some(i => i.fixable)) {
-      const fixed = fixContent(content);
-      if (fixed !== content) {
-        const fixCount = issues.filter(i => i.fixable).length;
+      const fix = fixContentWithCount(content, page);
+      if (fix.content !== content) {
         if (!dryRun) {
-          writeFileSync(page, fixed);
+          writeFileSync(page, fix.content);
         }
-        console.log(`  ${dryRun ? '(dry run) ' : ''}Fixed ${fixCount} issue(s)`);
+        cliFixed += fix.fixedCount;
+        console.log(`  ${dryRun ? '(dry run) ' : ''}Fixed ${fix.fixedCount} issue(s)`);
       }
     }
   }
 
   progress.finish();
 
-  // Re-run core for the aggregate counts (cheap; re-parses contents but
-  // produces canonical numbers for the summary line).
-  const result = await runLintCore({ target, fix: doFix, dryRun });
+  // Re-run core read-only for the aggregate counts after any CLI-applied
+  // writes. Do not run the fixer again here, or the summary reports 0 fixed
+  // after the first pass already did the work.
+  const result = await runLintCore({ target, fix: false, dryRun });
   console.log(`\n${result.pages_scanned} pages scanned. ${result.total_issues} issue(s) in ${result.pages_with_issues} page(s).`);
   if (doFix) {
-    console.log(`${dryRun ? '(dry run) ' : ''}${result.total_fixed} auto-fixed.`);
+    console.log(`${dryRun ? '(dry run) ' : ''}${cliFixed} auto-fixed. ${result.total_fixable} fixable issue(s) remain.`);
   } else if (result.total_issues > 0) {
     console.log(`Run with --fix to auto-fix fixable issues.`);
   }

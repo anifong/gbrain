@@ -348,6 +348,42 @@ describe('runEmbedCore --stale egress fix (SQL-side filter)', () => {
     expect(staleChunkInUpsert.embedding).toBeInstanceOf(Float32Array);
   });
 
+  test('duplicate stale slugs in different sources are re-fetched and upserted source-scoped', async () => {
+    const { runEmbedCore } = await import('../src/commands/embed.ts');
+
+    const stale = [
+      { slug: 'same-slug', source_id: 'default', chunk_index: 0, chunk_text: 'default text', chunk_source: 'compiled_truth' as const, model: null, token_count: null },
+      { slug: 'same-slug', source_id: 'vault', chunk_index: 0, chunk_text: 'vault text', chunk_source: 'compiled_truth' as const, model: null, token_count: null },
+    ];
+    const getChunkCalls: Array<{ slug: string; opts?: { sourceId?: string } }> = [];
+    const upsertCalls: Array<{ slug: string; opts?: { sourceId?: string } }> = [];
+
+    const engine = mockEngine({
+      countStaleChunks: async () => 2,
+      listStaleChunks: async () => stale,
+      getChunks: async (slug: string, opts?: { sourceId?: string }) => {
+        getChunkCalls.push({ slug, opts });
+        return [{ chunk_index: 0, chunk_text: `${opts?.sourceId} text`, chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 }];
+      },
+      upsertChunks: async (slug: string, _chunks: any[], opts?: { sourceId?: string }) => {
+        upsertCalls.push({ slug, opts });
+      },
+    });
+
+    const result = await runEmbedCore(engine, { stale: true });
+
+    expect(result.embedded).toBe(2);
+    expect(result.pages_processed).toBe(2);
+    expect(getChunkCalls.map(c => [c.slug, c.opts?.sourceId]).sort()).toEqual([
+      ['same-slug', 'default'],
+      ['same-slug', 'vault'],
+    ]);
+    expect(upsertCalls.map(c => [c.slug, c.opts?.sourceId]).sort()).toEqual([
+      ['same-slug', 'default'],
+      ['same-slug', 'vault'],
+    ]);
+  });
+
   test('--stale dry-run: counts stale via countStaleChunks, reports via listStaleChunks, no embedBatch or upsertChunks', async () => {
     const { runEmbedCore } = await import('../src/commands/embed.ts');
     const stale = [
