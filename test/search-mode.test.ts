@@ -38,6 +38,22 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
   // The cell-by-cell assertion. The methodology doc cites these.
   // v0.35.0.0+ extended with 5 reranker fields. tokenmax flips reranker on;
   // conservative + balanced keep it off until eval data backs a change.
+  // v0.36 cross-modal wave: shared defaults across all modes (opt-in).
+  const CROSS_MODAL_DEFAULTS = {
+    cross_modal_both_text_weight: 0.6,
+    cross_modal_both_image_weight: 0.4,
+    image_query_text_refinement_weight: 0.4,
+    image_query_image_refinement_weight: 0.6,
+    unified_multimodal: false,
+    unified_multimodal_only: false,
+    cross_modal_llm_intent: false,
+  };
+
+  // v0.40.3.0 contextual retrieval per-mode defaults. Tests below spread
+  // this AFTER CROSS_MODAL_DEFAULTS so each per-mode block overrides
+  // contextual_retrieval to its tier value.
+  const CR_DISABLED_DEFAULT = { contextual_retrieval_disabled: false };
+
   test('conservative bundle values are canonical', () => {
     expect(MODE_BUNDLES.conservative).toEqual({
       cache_enabled: true,
@@ -52,10 +68,17 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_top_n_in: 30,
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
+      floor_ratio: undefined,
+      ...CROSS_MODAL_DEFAULTS,
+      graph_signals: false,
+      ...CR_DISABLED_DEFAULT,
+      contextual_retrieval: 'none',
     });
   });
 
   test('balanced bundle values are canonical', () => {
+    // v0.36.0.0 (D6): reranker_enabled flipped from false → true. The 60%
+    // top-1 reshuffle reaches the 80% of installs that stay on `balanced`.
     expect(MODE_BUNDLES.balanced).toEqual({
       cache_enabled: true,
       cache_similarity_threshold: 0.92,
@@ -64,11 +87,16 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       tokenBudget: 12000,
       expansion: false,
       searchLimit: 25,
-      reranker_enabled: false,
+      reranker_enabled: true,
       reranker_model: 'zeroentropyai:zerank-2',
       reranker_top_n_in: 30,
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
+      floor_ratio: undefined,
+      ...CROSS_MODAL_DEFAULTS,
+      graph_signals: true,
+      ...CR_DISABLED_DEFAULT,
+      contextual_retrieval: 'title',
     });
   });
 
@@ -86,6 +114,11 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_top_n_in: 30,
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
+      floor_ratio: undefined,
+      ...CROSS_MODAL_DEFAULTS,
+      graph_signals: true,
+      ...CR_DISABLED_DEFAULT,
+      contextual_retrieval: 'per_chunk_synopsis',
     });
   });
 
@@ -265,9 +298,47 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
 
   test('KNOBS_HASH_VERSION constant exposed for migrations to bump on schema change', () => {
     // v0.35.0.0+ bumped 1→2 to fold reranker fields into the cache key.
-    // CDX2-F14: a timeout change from 5s to 100ms changes search behavior
-    // (more fail-opens) so stale cache rows must invalidate.
-    expect(KNOBS_HASH_VERSION).toBe(2);
+    // v0.35.6.0 bumped 2→3 to fold floor_ratio (codex outside-voice T1 —
+    // preventing cross-floor cache contamination).
+    // v0.36 piggybacks on v=3 with 7 additional cross-modal knobs (D2) PLUS
+    // embedding column + provider context (D8/CDX-2 cross-column isolation),
+    // all appended per CDX2-F13 append-only convention so a text-mode cache
+    // hit can never silently serve to an image-mode caller, and a query
+    // against `embedding_voyage` never shares a cache row with `embedding`.
+    // v0.40.4 (salem) + v0.39 T21 (master): bumped 3→4 to fold graph_signals
+    // (so a graph-on cache write cannot be served to a graph-off lookup) AND
+    // schema-pack hash fields (pack name + pack version, so cross-pack
+    // contamination is structurally impossible).
+    // v0.40.3.0 (D8): bumped 4→5 to add contextual_retrieval (CRMode) and
+    // contextual_retrieval_disabled (kill switch). A query against a brain
+    // on tokenmax (per-chunk synopsis) must not be served from a cache row
+    // written when the brain was on balanced (title-only) — different
+    // embedding spaces. Sequenced behind salem's v=4 graph-signals work.
+    expect(KNOBS_HASH_VERSION).toBe(5);
+  });
+
+  test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
+    // Without this, a no-floor write would be served to a floor-enabled read
+    // — direct ranking-correctness leak. Same bug class CDX-4 closed in v0.32.3
+    // for the other search-lite knobs.
+    const noFloor = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const withFloor = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.85 } }));
+    expect(noFloor).not.toBe(withFloor);
+  });
+
+  test('T1 (codex): different floor_ratio values produce different hashes', () => {
+    // 0.85 and 0.90 are distinct cache rows. 4-decimal precision in the hash
+    // input means 0.85 and 0.851 also differ (consumers tuning by hundredths
+    // get a clean cache split).
+    const a = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.85 } }));
+    const b = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.90 } }));
+    expect(a).not.toBe(b);
+  });
+
+  test('same floor_ratio produces same hash (idempotent cache key)', () => {
+    const a = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.85 } }));
+    const b = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.85 } }));
+    expect(a).toBe(b);
   });
 });
 
@@ -310,6 +381,20 @@ describe('loadOverridesFromConfig flat-map parser', () => {
     expect(loadOverridesFromConfig({ 'search.cache.similarity_threshold': '0' }).cache_similarity_threshold).toBeUndefined();
     expect(loadOverridesFromConfig({ 'search.cache.similarity_threshold': '-0.1' }).cache_similarity_threshold).toBeUndefined();
   });
+
+  test('v0.35.6.0: floor_ratio parses valid 0..1 values', () => {
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': '0.85' }).floor_ratio).toBe(0.85);
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': '0' }).floor_ratio).toBe(0);
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': '1' }).floor_ratio).toBe(1);
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': '0.5' }).floor_ratio).toBe(0.5);
+  });
+
+  test('v0.35.6.0: floor_ratio rejects out-of-range values silently', () => {
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': '-0.1' }).floor_ratio).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': '1.5' }).floor_ratio).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': 'NaN' }).floor_ratio).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': 'cheese' }).floor_ratio).toBeUndefined();
+  });
 });
 
 describe('SEARCH_MODE_CONFIG_KEYS is the full reset surface', () => {
@@ -333,5 +418,62 @@ describe('Type-only smoke test (compiler sees SearchMode union)', () => {
   test('SearchMode union is exactly 3 modes (compile-time)', () => {
     const valid: SearchMode[] = ['conservative', 'balanced', 'tokenmax'];
     expect(valid.length).toBe(3);
+  });
+});
+
+describe('v0.40.4 — graph_signals knob', () => {
+  test('default per mode: conservative=false, balanced=true, tokenmax=true', () => {
+    expect(MODE_BUNDLES.conservative.graph_signals).toBe(false);
+    expect(MODE_BUNDLES.balanced.graph_signals).toBe(true);
+    expect(MODE_BUNDLES.tokenmax.graph_signals).toBe(true);
+  });
+
+  test('config key search.graph_signals overrides bundle (true → false)', () => {
+    const ov = loadOverridesFromConfig({ 'search.graph_signals': 'false' });
+    expect(ov.graph_signals).toBe(false);
+    const resolved = resolveSearchMode({ mode: 'balanced', overrides: ov });
+    expect(resolved.graph_signals).toBe(false);
+  });
+
+  test('config key search.graph_signals overrides bundle (false → true)', () => {
+    const ov = loadOverridesFromConfig({ 'search.graph_signals': '1' });
+    expect(ov.graph_signals).toBe(true);
+    const resolved = resolveSearchMode({ mode: 'conservative', overrides: ov });
+    expect(resolved.graph_signals).toBe(true);
+  });
+
+  test('per-call overrides config + mode bundle', () => {
+    const resolved = resolveSearchMode({
+      mode: 'balanced',
+      overrides: { graph_signals: false },
+      perCall: { graph_signals: true },
+    });
+    expect(resolved.graph_signals).toBe(true);
+  });
+
+  test('knobsHash distinct for graph_signals=true vs =false', () => {
+    const on = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { graph_signals: true } }));
+    const off = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { graph_signals: false } }));
+    expect(on).not.toBe(off);
+  });
+
+  test('SEARCH_MODE_CONFIG_KEYS includes search.graph_signals', () => {
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.graph_signals');
+  });
+
+  test('attributeKnob reports source correctly for graph_signals', () => {
+    const input = { mode: 'balanced', perCall: { graph_signals: false } };
+    const resolved = resolveSearchMode(input);
+    const attr = attributeKnob('graph_signals', input, resolved);
+    expect(attr.source).toBe('per-call');
+    expect(attr.value).toBe(false);
+  });
+
+  test('attributeKnob mode source when no override', () => {
+    const input = { mode: 'tokenmax' };
+    const resolved = resolveSearchMode(input);
+    const attr = attributeKnob('graph_signals', input, resolved);
+    expect(attr.source).toBe('mode');
+    expect(attr.value).toBe(true);
   });
 });

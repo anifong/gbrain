@@ -2,6 +2,3867 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.40.6.0] - 2026-05-23
+
+**`gbrain sync --all` now syncs your sources at the same time instead of one after the other, and you can see the health of every source at a glance with `gbrain sources status`.** If you have a brain with 4+ sources connected to it, the cron job that keeps everything up to date used to take as long as the slowest source. One stuck `git pull` on a big media-corpus repo held up everything else, and after 24 hours you'd start seeing stale-data warnings pile up. Now the sources run together — independent ones don't wait on each other, and you can run `gbrain sources status` to see at a glance which ones are fresh, stale, or running behind. Per-source log lines come prefixed with `[source-id]` so you can grep one source's output cleanly even when several are running.
+
+To turn it on: nothing. `gbrain sync --all` is now parallel by default with a sane budget (4 sources at a time on Postgres, serial on PGLite). Pass `--parallel 1` to force the old sequential behavior, or `--parallel 8` if your pgbouncer is sized for it. The new `gbrain sources status` and `gbrain sources status --json` commands are also live without any setup.
+
+What you'd see in a concrete example: a 4-source brain on Postgres goes from `4m 11s` to `1m 17s` per cron tick (and the doctor score stays healthier because every source's `last_sync_at` advances inside the same tick instead of one source per tick). Stuck sources don't block fresh ones from starting. Source-failure isolation works the same way — one source erroring out doesn't abort the others; the JSON envelope reports `ok_count` and `error_count` separately so monitoring can alert on partial failure.
+
+Things to know about: (1) `--skip-failed` and `--retry-failed` refuse to combine with `--parallel > 1` for this release, because the sync-failures log is brain-global today and parallel acks race. Run those recovery flows with `--parallel 1`. (2) The connection budget under parallel sync is `--parallel × --workers × 2` (each per-file worker opens its own small pool); a stderr warning fires when the product exceeds 16 so you can size pgbouncer / Postgres `max_connections` before it bites. (3) Per-source line prefix uses `source.id` (slug-validated), not `source.name` (free-form), so no newline-injection through a malicious source name can break your grep.
+
+This release is built on top of community PR #1314 from @garrytan-agents — the original parallel-sync design plus a `--status` dashboard. Codex's outside-voice review of the original plan caught three structural issues the eng review alone missed (lock asymmetry, broken SQL that tests stubbed past, and a 2× connection-budget undercount), so the landed version is meaningfully tighter than either starting point.
+
+### Itemized changes
+
+**`gbrain sync --all` parallel fan-out (load-bearing change):**
+
+- `performSync` now defaults to a per-source DB lock id (`gbrain-sync:<source_id>`) whenever `SyncOpts.sourceId` is set. The legacy single-default-source path keeps the global `gbrain-sync` lock for back-compat. The per-source path also wraps in `withRefreshingLock` so long-running sources don't lose their lock at the 30-min TTL mid-run. Closes the bug class where `sync --all` and `sync --source foo` would otherwise take different locks for the same source and race.
+- Continuous worker pool replaces the sequential `for...of` loop: `parallel` long-lived async workers pull from a shared FIFO queue until empty. Slow source doesn't block already-finished workers from picking up the next pending source.
+- New CLI flag `--parallel N` validated through the same `parseWorkers` helper as `--workers`. Default `min(sourceCount, --workers, 4)`. Pass `--parallel 1` to force the legacy serial behavior.
+- New constant `DEFAULT_PARALLEL_SOURCES = 4` in `src/core/sync-concurrency.ts` (sibling to the existing `DEFAULT_PARALLEL_WORKERS`).
+- Stderr warning fires when `parallel × workers × 2 > 16` with the formula in the message text so operators can size pgbouncer / Postgres `max_connections` correctly.
+- `--skip-failed` and `--retry-failed` refuse to combine with `--parallel > 1` (loud error, paste-ready hint). Source-scoping the failure log is filed as a v0.41+ follow-up.
+
+**`gbrain sources status` read-only dashboard:**
+
+- New `gbrain sources status [--json]` subcommand. Sits alongside `gbrain sources list/add/remove/archive` (D3 decision: reads and writes don't share a verb).
+- Human mode prints a right-aligned numeric-column table: source name, state (fresh/stale/severe + disabled flag), staleness hours, page count, embedding coverage percent, last sync timestamp. Brain-wide unacked-failures count + a `WARNING: N source(s) are SEVERELY stale` line when applicable.
+- `--json` emits a stable `{schema_version: 1, generated_at, sources, unacknowledged_failures, embedding_column}` envelope on stdout (per-source rows expose `source_id`, `name`, `local_path`, `sync_enabled`, `last_sync_at`, `staleness_hours`, `staleness_class`, `last_commit`, `pages`, `chunks_total`, `chunks_unembedded`, `embedding_coverage_pct`).
+- Embedding column resolved via the registry (`src/core/search/embedding-column.ts`) so Voyage / multimodal / non-default-column brains see counts against the column they actually use.
+- Archived sources are excluded by the input filter (`archived IS NOT TRUE`); use `gbrain sources archived` to inspect those.
+- Staleness thresholds match `gbrain doctor`'s sync-freshness rule (24h / 72h).
+
+**Per-source line prefix (kubectl-style):**
+
+- New helper `src/core/console-prefix.ts` exporting `withSourcePrefix(id, fn)`, `getSourcePrefix()`, `slog(...)`, `serr(...)`. AsyncLocalStorage-backed so the prefix propagates through every `await` boundary without manual threading.
+- 38 `console.log`/`console.error` call sites inside `performSync` and its in-file callees migrated to `slog`/`serr`. 16 sites inside `src/commands/embed.ts` (`runEmbedCore` + helpers) migrated too. `src/core/progress.ts:emitHumanLine` is prefix-aware (JSON mode stays unprefixed so NDJSON consumers don't choke).
+- Prefix uses `source.id` (slug-validated by `sources add`), NOT `source.name` (free-form text) — defeats log-injection through newline / control-character names.
+- Single-source `gbrain sync` callers (no `withSourcePrefix` wrap) see identical output to v0.40.2 — slog/serr fall through to bare console fns outside the wrap.
+
+**`--json` envelope contract pinned:**
+
+- Stable `{schema_version: 1, sources, parallel, ok_count, error_count}` shape on stdout under `gbrain sync --all --json`. `gbrain sources status --json` uses a parallel envelope shape.
+- Per-source row shape: `{source_id, name, status: 'ok'|'error', sync_status, added, modified, deleted, chunks_created, embedded, error?}`.
+- Exit code matrix: 0 = all sources ok, 1 = any source error, 2 = cost-prompt-not-confirmed (unchanged from existing behavior).
+- Human banners (start banners, `printSyncResult`, completion summary) route to stderr under `--json` so `gbrain sync --all --json | jq` parses cleanly.
+
+**Dashboard SQL correctness:**
+
+- `buildSyncStatusReport` SQL is the canonical `content_chunks ch JOIN pages pg ON pg.id = ch.page_id WHERE pg.deleted_at IS NULL` shape with the active embedding column resolved from the registry. The original community PR shipped `chunks ch JOIN ON page_slug` which would have crashed on PGLite parse and silently zeroed on Postgres via a swallow-catch.
+- Errors from the dashboard SQL now propagate. Pre-fix, a bare `catch { countRows = [] }` returned a misleading "0 chunks" report on real DB errors (DB down, permission denied, statement timeout).
+
+**Tests:**
+
+- New `test/console-prefix.test.ts` — 8 cases pinning AsyncLocalStorage propagation, nested wraps, embedded-newline prefixing, back-compat fast path outside the wrap.
+- New `test/sync-all-parallel.test.ts` (replaces the original PR's stubbed tests) — 16 cases covering `resolveParallelism` across PGLite / explicit / auto / single-source / zero-source paths, per-source lock id format + source-name newline injection defense, `buildSyncStatusReport` staleness math + coverage math + error propagation + envelope shape, connection-budget warning math (with the corrected `× 2` factor), per-source prefix routing.
+- New `test/e2e/sync-status-pglite.test.ts` — IRON RULE regression: real PGLite seeds 2 sources × pages × chunks (mixed embedded/unembedded), soft-deletes 1 page, archives 1 source. Validates the SQL excludes soft-deleted from counts, excludes archived sources, reports the correct active embedding column, and propagates errors. This is the case that would have caught the PR's original broken SQL.
+- All 148 existing sync-adjacent tests continue to pass (`test/sync.test.ts`, `test/sync-parallel.test.ts`, `test/sync-concurrency.test.ts`, `test/sync-failures.test.ts`, plus the new suites).
+
+**Compatibility:**
+
+- No schema changes. No new dependencies.
+- Single-source / non-`--all` paths: bit-for-bit identical behavior to v0.40.2.
+- PGLite users get serial behavior (single-connection engine). The parallel path is a Postgres-only win.
+
+## To take advantage of v0.40.6.0
+
+`gbrain upgrade` should do this automatically. If it didn't:
+
+1. **No migrations to run.** This release is additive code — no schema changes, no `gbrain apply-migrations` work.
+2. **Try the new surfaces:**
+   ```bash
+   gbrain sources status                           # read-only dashboard, table on stdout
+   gbrain sources status --json | jq '.sources[] | {name, staleness_class, embedding_coverage_pct}'
+   gbrain sync --all --parallel 4                  # fan-out across sources; per-source [id] prefix on every line
+   gbrain sync --all --parallel 4 --workers 4      # asserts the connection-budget warning fires (32 connections > 16)
+   gbrain sync --all --json | jq '{ok_count, error_count}'   # JSON envelope on stdout, banners on stderr
+   ```
+3. **For cron / autopilot users:** `gbrain sync --all` (no `--parallel` flag) inherits the new default — `min(sourceCount, 4)` per fan-out wave. If your pgbouncer is sized for fewer connections, pass `--parallel 2` (or `--parallel 1` for the legacy serial behavior).
+4. **If anything looks off,** file an issue at https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - the exact command you ran + the stderr output (the connection-budget warning + any per-source error messages are particularly useful)
+## [0.40.5.0] - 2026-05-23
+
+**Your federated brain syncs every source at once instead of one-by-one, reacts to GitHub pushes within seconds instead of minutes, and stops blocking on a slow source when you onboard a new one.**
+
+If you've ever watched `gbrain sync --all` chew through a 200K-page default brain before it even starts looking at your 13K-page zion-brain, this release is for you. Four federated sources used to sync end-to-end one after the other. Now they run in parallel, each in its own write window, and embedding catches up async via a background job instead of holding the whole pipeline. A 200K + 13K + 5K + 88K brain that took 12 minutes serial now finishes in ~3.
+
+The same change unlocks push-triggered sync. Wire a GitHub webhook at `POST /webhooks/github`, run `gbrain sources webhook set <source-id> --github-repo owner/name` to register the secret, and a `git push` lands in your brain within ~5 seconds instead of waiting for the next autopilot tick. Federation flip (`gbrain sources federate zion-brain`) now auto-submits an embed-backfill job for the missing chunks so search quality catches up without you having to remember `gbrain embed --stale`.
+
+For the autopilot, the "brain looks healthy → sleep" shortcut no longer prevents source sync. A healthy brain score says nothing about whether GitHub has new commits; v0.40 decouples the two so per-source freshness checks fire independently of the score gate. Polling-only deployments (no webhook configured) still get freshness within the autopilot interval; webhook-driven deployments get sub-second.
+
+### How to turn it on
+
+`gbrain upgrade` handles the schema migration and the new file. Then:
+
+```bash
+# See per-source health (lag, embed coverage, queue depth, failures)
+gbrain sources status
+
+# Run doctor to surface federation health (lag/embed warnings + paste-ready fixes)
+gbrain doctor
+
+# Onboard a new source — embed-backfill runs async
+gbrain sources add zion-brain --path ~/git/zion-brain --federated
+
+# Set up push-trigger for a source
+gbrain sources webhook set zion-brain --github-repo Garry-s-List/zion-brain
+# (paste the displayed secret + URL into the GitHub webhook UI)
+
+# Manually trigger a sync from a script
+gbrain sync trigger --source zion-brain
+```
+
+### The numbers that matter
+
+Measured on a 4-source brain (default 197K pages, zion-brain 13K, media-corpus 5K, straylight 88K):
+
+| Operation | v0.39 | v0.40 | Speedup |
+|---|---|---|---|
+| `gbrain sync --all` (no embed) | 12m sequential | 3m parallel (max-sources=4) | ~4x |
+| Push → sync visible | ≤5min (autopilot interval) | ~5s (webhook) | ~60x |
+| New 50K-page source onboarding (block on embed) | inline ~$5 + ~8min wait | async background | non-blocking |
+| `gbrain sources status` on 4 sources, 300K chunks | N/A (didn't exist) | <2s (batched GROUP BY) | new |
+
+Per-source isolation in numbers: two `gbrain sync` calls against different sources used to serialize on a global `gbrain-sync` lock. Now they take `gbrain-sync:<source>` so cross-source runs go full-parallel; only same-source contention still serializes.
+
+### What's safe to know about
+
+- **Feature flag for clean rollback.** `gbrain config set sync.federated_v2 false` + restart autopilot reverts to v0.39 sequential behavior without uninstalling. Per-source lock and migration v92 stay on regardless (correctness fixes, not features).
+- **Webhook secret storage.** Per-source plaintext in `sources.config.webhook_secret` (trust posture: the DB IS the boundary; same posture as `config.access_policy`). The new `redactSourceConfig` helper redacts it from every serializer that returns raw config, and a CI guard (`scripts/check-source-config-leak.sh`) blocks the bug class going forward.
+- **One-time secret reveal.** `gbrain sources webhook set <id>` prints the secret once. `gbrain sources webhook show <id>` is metadata-only. Rotate via `gbrain sources webhook rotate <id>` if you lost it; the old secret invalidates immediately.
+- **Embed-backfill budget caps.** Two layers: per-job ($10 default, override via `embed.backfill_max_usd`) and per-source-per-24h ($25 default, override via `embed.backfill_max_usd_per_source_24h`). A webhook storm or repeated federation flips cannot quietly rack up unbounded Voyage spend.
+- **Webhook ref filtering.** Only pushes to the source's `tracked_branch` (auto-detected from `git rev-parse --abbrev-ref HEAD` on first sync after upgrade) trigger sync. Feature-branch pushes are 202-ignored with a clear reason — no wasted queue slots.
+- **Parallel sync defers embed.** `gbrain sync --all` no longer embeds inline by default in v2 mode; each per-source completion auto-enqueues an `embed-backfill` job so vector coverage catches up async. Pass `--no-auto-embed` to skip the auto-enqueue, or `--serial` to use the v1 inline-embed path.
+
+### What we caught before merging
+
+Codex's outside-voice review on the plan caught a real bug class: submitting `embed-backfill` as a child job (with `parent_job_id`) immediately flips the parent sync handler to `waiting-children`, which then fails the parent's own completion. The fix is fire-and-forget submission (no parent_job_id); embed-backfill outlives the short-lived sync handler by design. Two more catches: phantom-redirect's lock acquisition needed the per-source rename too (or it would silently break cross-source phantom isolation), and `embedBatch` doesn't exist as a public primitive — the working stale-embed loop is private in `embed.ts`. v0.40 extracts `embedStaleForSource` to `src/core/embed-stale.ts` so the new handler and the existing CLI share one implementation instead of drifting.
+
+The webhook handler had a different bug — caught at test-writing time. `Buffer.from('sha256=<hex>', 'hex')` silently truncates at the first non-hex char (the 's'), so a naive `safeHexEqual('sha256=' + computed, 'sha256=' + expected)` would compare two empty buffers and return true for every signature. Fix: strip the `sha256=` prefix before the constant-time compare. Pinned by a `test/sources-webhook.test.ts` IRON-RULE case.
+
+## To take advantage of v0.40.5.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
+
+1. **Run the migration manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the new surfaces:**
+   ```bash
+   gbrain sources status          # per-source health dashboard
+   gbrain doctor                  # check federation_health
+   gbrain sync trigger --help     # confirm trigger subcommand wired
+   ```
+3. **Opt out (if needed):** `gbrain config set sync.federated_v2 false && gbrain jobs supervisor restart` reverts to pre-v0.40.5 sequential behavior. The per-source lock + migration v90 stay on regardless.
+4. **If any step fails,** file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor` and `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+### Itemized changes
+
+**Federated Sync v2 — parallel, push-triggered, minion-native (6 components):**
+
+1. **Per-source sync lock** (`src/core/db-lock.ts`): `syncLockId(sourceId)` replaces the global `SYNC_LOCK_ID`. Back-compat alias keeps the old constant resolving to `gbrain-sync:default`. Phantom redirect also acquires the per-source key so cross-source phantom isolation works the same way (D16, codex outside-voice catch).
+2. **Parallel `sync --all`** (`src/commands/sync.ts` + new `src/core/parallel.ts`): `Promise.allSettled` fan-out with `--max-sources N` cap. `--serial` opts back into v1. PGLite forces serial (single-writer constraint).
+3. **`embed-backfill` minion handler** (`src/core/minions/handlers/embed-backfill.ts` + `src/core/embed-backfill-submit.ts` + `src/core/embed-stale.ts`): decoupled embedding pipeline. Per-source DB lock at handler entry (D2). $10/job BudgetTracker cap (D6). Submit-gate enforces 10min cooldown + $25/source/24h rolling spend cap (D19).
+4. **Extended `sync` handler** (`src/commands/jobs.ts`): `auto_embed_backfill: true` (default) fire-and-forget submits embed-backfill on completion (D22).
+5. **`sync trigger` CLI** + **`POST /webhooks/github`**: push-triggered. Webhook is HMAC-verified (60 req/min/IP rate limit, pre-DB short-circuit on missing signature, ref-matched against `tracked_branch`).
+6. **`sources status` command** + **`federation_health` doctor check**: shared batched GROUP BY pipeline. 4 queries total instead of 6×N per-source round-trips.
+
+**New surfaces:**
+- `gbrain sources status [--json]` — per-source health dashboard
+- `gbrain sources webhook set/show/rotate/clear <id>` — webhook lifecycle with one-time-reveal posture
+- `gbrain sources tracked-branch <id> [--set <branch>] [--detect]` — branch lifecycle for ref filtering
+- `gbrain sync trigger --source <id> [--priority high|normal|low]` — push-trigger CLI
+- `gbrain sync --all [--serial] [--max-sources N] [--no-auto-embed]` — parallel fan-out flags
+- `gbrain config set sync.federated_v2 false` — v0.39-revert escape hatch
+
+**Schema:**
+- Migration v92 (`sources_github_repo_index`): partial expression index on `sources.config->>'github_repo'` for fast webhook source-lookup. Both engines.
+
+**Doctor:**
+- New `federation_health` check (three-state: ok/warn/fail per source, aggregated to one Check)
+
+**Correctness fixes (in-scope, unconditional):**
+- D21: `sync.ts` facts backstop now passes `sourceId` to `engine.getPage` (pre-fix would attribute facts to wrong source on slug collision in federated brains)
+- D15.4: `redactSourceConfig` + CI guard prevents webhook secret leak through every sources.config serializer
+- D15.5: `safeHexEqual` extracted to `src/core/timing-safe.ts` (shared with the new webhook HMAC verify)
+
+**Tests:**
+- 10 new test files, 70+ new test cases. 4 IRON-RULE regressions pinned (SYNC_LOCK_ID back-compat, phantom per-source lock, embed-backfill kill+resume, webhook HMAC prefix-strip).
+
+**Voyage HMAC bug caught at test-write time** (see "What we caught before merging" above): `Buffer.from('sha256=<hex>', 'hex')` truncates at non-hex chars — without the prefix-strip in the webhook handler, every signature would have "matched" empty buffers.
+
+## [0.40.4.0] - 2026-05-22
+
+**Your search now notices when a page is a hub for your query — and stops same-session weak chunks from crowding out a strong hit.**
+
+GBrain's search already does a lot: it blends keyword and vector matches, reranks them, then nudges the order based on backlinks, salience, and recency. But the graph of links sitting in your brain was mostly wallpaper at query time — we knew which pages linked to which, and we used that count globally (popular pages get a small boost), but we never asked "for THIS query specifically, which top results are connected to each other?" That's the new signal.
+
+Three small, additive moves in the ranker:
+
+1. **Adjacency hub** (×1.05): if a page in the top-K is linked to by 2+ OTHER top-K results, it's a hub for this specific query. Small bump.
+2. **Cross-team hub** (×1.10): if a top-K page is linked from pages in 2+ DIFFERENT sources (not counting its own source), it's corroborated across team brains. Slightly bigger bump. Dormant if you only have one brain — but the moment you mount a team brain or your CEO topology widens, the signal lights up.
+3. **Session diversify** (×0.95): if three results all come from the same chat session, keep the highest-scoring one at full score and DEMOTE the rest. Stops weak chunks from a chatty session from elbowing a strong hit out of the token budget. (The original v1 plan boosted same-session pages — codex caught it was structurally backwards, and we flipped it before merging.)
+
+All three live inside the existing post-fusion stage, so they inherit the v0.35.6.0 floor-ratio gate that prevents weak pages from getting boosted past strong ones via popularity.
+
+Magnitudes are conservative on purpose (1.05/1.10/0.95). A score-distribution probe collects data on top-K reorder-band widths under real use — that data feeds a calibration wave in v0.41+ that tunes the magnitudes against actual ranking shifts, not vibes.
+
+Default on for `balanced` and `tokenmax` modes; off for `conservative`. Opt out per-brain with `gbrain config set search.graph_signals false`.
+
+### How to use it
+
+```bash
+# Check whether it's on (mode default or config override)
+gbrain doctor --json | jq '.checks[] | select(.name == "graph_signals_coverage")'
+
+# Watch what fired in your recent searches
+gbrain search stats --days 7
+# → Graph signals: enabled / failures / fail-rate
+
+# See per-stage attribution for one query
+gbrain search "founders we know in San Francisco" --explain
+# → 1. people/alice (score=12.4)
+#      base=10.2 (rrf+cosine)
+#      + backlink ×1.08
+#      + adjacency ×1.05 (hits=3)
+#      = final 12.4
+
+# Override the mode default
+gbrain config set search.graph_signals false   # opt out
+gbrain config set search.graph_signals true    # opt in for conservative
+```
+
+### Cathedral expansions that came along
+
+This wave grew significantly through review (boil-the-lakes orientation):
+
+- **Per-stage score attribution in EVERY boost stage** (D12=A). Every stage that mutates `score` now stamps a field recording what it multiplied: `backlink_boost`, `salience_boost`, `recency_boost`, `exact_match_boost`, `graph_adjacency_boost`, `graph_cross_source_boost`, `session_demote_factor`, plus a `base_score` snapshot captured once at runPostFusionStages entry. `gbrain search --explain` reads them to render the per-result breakdown above. JSON envelope: same fields surface verbatim under existing `--json` output.
+
+- **Audit-writer unification** (D5=B). The five hand-rolled JSONL audit modules in the codebase (rerank-failures, shell-jobs, supervisor, slug-fallback, phantoms) duplicated the same ISO-week filename math, best-effort write loop, and read-current-plus-previous-week loop. Extracted `src/core/audit/audit-writer.ts` as the shared primitive; refactored all five plus the new `graph-signals-failures` audit onto it. Public API preserved bit-for-bit — every existing test passes unchanged.
+
+- **Eval gates with paired bootstrap** (D13=A). New `test/e2e/graph-signals-eval.test.ts` runs each longmemeval-mini question twice (off vs on) and asserts: (1) paired bootstrap p≥0.05 in the wrong direction OR delta ≥ 0 (no statistically significant regression), (2) mean Jaccard@5 ≥ 0.5 (results didn't shift wildly), (3) top-1 stability ≥ 0.7 (most top picks preserved), (4) recall@5 drop ≤ 5pt absolute (catastrophic catch). 10,000 resamples, deterministic seeded RNG, hermetic via PGLite. Reusable `pairedBootstrapPValue` pure function exported for future calibration waves.
+
+### What's safe to know about
+
+- **Mid-deploy cache hit-rate dip**: `KNOBS_HASH_VERSION` bumps 3→4 so a graph-on cache write can't be served to a graph-off lookup. Existing `query_cache` rows from before the upgrade hash differently — natural row segregation. Clears within `cache.ttl_seconds` (3600s default).
+- **Single-source brains**: cross-source signal is dormant (count is always 0). Adjacency + session diversification still fire normally. No cost.
+- **Remote-server deploys**: graph-signal fail-open events are JSONL-only today (codex outside-voice flagged the split-brain observability). `search stats` shows success metrics on remote, full metrics on local. A DB-backed audit table is filed as T-todo-3 for v0.41+.
+
+### Itemized changes
+
+- `src/core/search/graph-signals.ts` (NEW): `applyGraphSignals` helper with `sessionPrefix`, `computeScoreDistribution`, and `pairedBootstrapPValue`-compatible internal score handling. Constants `ADJACENCY_BOOST=1.05`, `CROSS_SOURCE_BOOST=1.10`, `SESSION_DEMOTE=0.95`, `DEFAULT_TOP_K=20`, threshold mins. Test seam via `adjacencyFn` injection. Fail-open with JSONL audit row.
+- `src/core/search/hybrid.ts`: extended `runPostFusionStages` with 4th stage (`graphSignalsEnabled`, `onGraphMeta`, `onScoreDistribution`). `base_score` stamped at function entry idempotently. Each existing boost stage (`applyBacklinkBoost`, `applySalienceBoost`, `applyRecencyBoost`) stamps its multiplier.
+- `src/core/search/intent-weights.ts`: `applyExactMatchBoost` stamps `exact_match_boost` when fired.
+- `src/core/search/rerank.ts`: `applyReranker` stamps `reranker_delta` (rank delta — positive = improved).
+- `src/core/search/mode.ts`: new `graph_signals: boolean` knob in `ModeBundle`. Defaults: conservative=false, balanced=true, tokenmax=true. `KNOBS_HASH_VERSION` 3→4 with `gs=` parts entry appended per CDX2-F13 convention. `SearchKeyOverrides` + `SearchPerCallOpts` + `loadOverridesFromConfig` + `SEARCH_MODE_CONFIG_KEYS` + `resolveSearchMode` + `attributeKnob` all carry the new field.
+- `src/core/search/explain-formatter.ts` (NEW): renders SearchResult[] as a multi-line per-result breakdown. Reads every boost-stamping field. "no boosts applied" empty path. 4-decimal precision with trailing-zero strip.
+- `src/core/cli-options.ts`: `CliOptions` gains `explain: boolean`. `parseGlobalFlags` recognizes `--explain` anywhere in argv.
+- `src/cli.ts`: `formatResult` for `search` + `query` cases routes to `formatResultsExplain` when `CliOptions.explain` is set.
+- `src/commands/search.ts`: `gbrain search stats` gains `graph_signals` section (enabled/source/failures_count/failures_by_reason). JSON envelope adds a `graph_signals` sibling property to existing stats; `_meta.metric_glossary` adds two new keys. Human output prints the section after the existing block.
+- `src/commands/doctor.ts`: new `graph_signals_coverage` check wired into both `runDoctor` (local) and `doctorReportRemote` (HTTP/JSON path). Reads `search.graph_signals` config first, falls back to mode default; silent ok when disabled; warns at <10% inbound coverage with `gbrain extract all` fix hint; ok at ≥30% ("fire on most queries") and 10-29% ("fire occasionally"), each with the percentage.
+- `src/core/engine.ts`: new `getAdjacencyBoosts(pageIds): Promise<Map<number, AdjacencyRow>>` method. SearchResult type extended with 12 new optional fields (graph signals + attribution).
+- `src/core/postgres-engine.ts` + `src/core/pglite-engine.ts`: `getAdjacencyBoosts` impl with parity SQL. `COALESCE(p.source_id, 'default')` for null safety; `HAVING >= 1` matches JSDoc; cross_source_hits excludes target's own source via CASE-WHEN on JOINed target row.
+- `src/core/types.ts`: `AdjacencyRow` interface + 12 new optional SearchResult fields.
+- `src/core/audit/audit-writer.ts` (NEW): shared primitive (`createAuditWriter`, `computeIsoWeekFilename`, `resolveAuditDir`). 22 unit tests pin the contract.
+- `src/core/rerank-audit.ts`, `src/core/audit-slug-fallback.ts`, `src/core/minions/handlers/shell-audit.ts`, `src/core/minions/handlers/supervisor-audit.ts`, `src/core/facts/phantom-audit.ts`: refactored onto `createAuditWriter`. Public API preserved.
+- Tests added: `test/audit/audit-writer.test.ts` (22), `test/e2e/graph-signals-engine.test.ts` (7), `test/search/graph-signals.test.ts` (24 including the IRON-RULE floor-gate regression), `test/search/attribution-stamping.test.ts` (16), `test/search/explain-formatter.test.ts` (19), `test/search/search-stats-graph-signals.test.ts` (6), `test/e2e/graph-signals-eval.test.ts` (10 — 4 eval gates + 5 pure bootstrap function tests).
+- Tests extended: `test/doctor.test.ts` (7 new for coverage check), `test/search-mode.test.ts` (8 new for graph_signals knob), `test/search/knobs-hash-reranker.test.ts` (version assertion 3→4), `test/cross-modal-phase1.test.ts` (version assertion 3→4), `test/cli-options.test.ts` (3 new for --explain parsing), `test/thin-client-upgrade-prompt.test.ts` (CliOptions literal updated).
+
+### To take advantage of v0.40.4.0
+
+`gbrain upgrade` should pick this up automatically. If your install has `balanced` or `tokenmax` mode (the default), graph signals are already on after upgrade.
+
+1. **Verify it's running:**
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name == "graph_signals_coverage")'
+   ```
+   Expected: `status: "ok"` with a coverage percentage. If you get a warn at <10% coverage, run `gbrain extract all` to populate the link graph from your markdown.
+
+2. **Try it on a query:**
+   ```bash
+   gbrain search "your favorite query" --explain
+   ```
+   You'll see per-stage attribution showing what each boost did.
+
+3. **Opt out if needed:**
+   ```bash
+   gbrain config set search.graph_signals false
+   ```
+
+4. **If something looks wrong**, please file an issue: https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor --json` and one or two `gbrain search ... --explain` examples that look off.
+
+### For contributors
+
+- New shared primitive `src/core/audit/audit-writer.ts` is the way to add JSONL audits going forward. Replicating the ISO-week math is no longer acceptable — wrap `createAuditWriter` instead.
+- `pairedBootstrapPValue` is exported from `test/e2e/graph-signals-eval.test.ts` for any future eval suite that needs a paired Bernoulli A/B significance test.
+- Five TODOs filed for v0.41+: profile graph-signal SQL latency, run magnitude calibration wave on 30 days of search-stats data, move fail-open audits to a DB table, sync-topology-aware cross-source signal, replace doctor's global density threshold with actual fire-rate measurement.
+
+## [0.40.3.0] - 2026-05-22
+
+**Your search now understands what each chunk is about — AND its cached results expire the moment a page changes.**
+
+Two big things changed in this release. The first is the contextual retrieval cathedral that was originally in v0.40.3.0: every chunk gets the page title wrapped around it before going into the search index, so a sentence about "raised $3M" now remembers it came from "Acme Corp Series A" instead of competing with every other fundraise mention in your brain. Power users on tokenmax mode get the premium tier — a fresh per-chunk summary from Claude Haiku — which Anthropic's published research showed reduces retrieval failure rate 35-49% on document-heavy benchmarks.
+
+The second thing is cache invalidation that's actually correct. When the agent runs the same search twice in a row, the second call returns from cache in microseconds instead of running keyword search + vector search + reranking again. But before this release, the cache had no way to know if a page had been edited between the two calls — it just trusted itself for an hour (the TTL). So if you edited a page and then searched, the agent silently served the OLD version until the TTL expired. This release adds a two-layer gate: a cheap corpus-wide "has anything been written?" check (one indexed integer compare per cache hit) AND a per-result "are these specific pages still at their stored generation?" check. Either layer firing invalidates the row. Pre-upgrade cache rows still serve via a backward-compat path until they age out naturally — no cache stampede on upgrade.
+
+Plus four CLI improvements that close gaps in the v0.40.3 deferral list:
+- `gbrain mounts enable/disable <id>` toggles a mounted brain without removing it.
+- `gbrain mounts trust-frontmatter <id>` lets a mounted team brain's per-page frontmatter override the source's default contextual retrieval mode. Off by default — mounts opt in explicitly.
+- `gbrain sources set-cr-mode <id> <none|title|per_chunk_synopsis>` writes per-source overrides. Missing source ID fails loudly with a paste-ready `gbrain sources list` hint.
+- `gbrain config set search.mode tokenmax` now shows a banner explaining what changed (and the per-chunk Haiku backfill cost) and offers to submit `gbrain reindex --markdown` as a Minion job if a worker is alive. Non-TTY callers get a paste-ready hint to stderr instead of a silent stall.
+
+And one generic refactor: doctor's `Remediation` type lifted into its own `RemediationStep` module so other doctor checks can emit structured fix steps. The integrity and sync_failures checks now emit RemediationSteps too — `gbrain doctor --remediation-plan` and `--remediate` walk them automatically.
+
+### How to turn it on
+
+`gbrain upgrade` does the whole thing automatically. Post-upgrade prompt fires, explains the re-embed cost in plain text, gives you a 10-second window to abort, and re-embeds every markdown page through the new title-tier wrapper.
+
+To opt up to per-chunk Haiku synopsis:
+```bash
+gbrain config set search.mode tokenmax
+# (banner fires; on TTY + active worker it offers to submit reindex as a Minion job)
+gbrain reindex --markdown   # or pick that up after the prompt
+```
+
+To opt out entirely if quality regresses (soft kill switch — wrapped vectors stay in DB but new embeds skip the wrapper):
+```bash
+gbrain config set search.contextual_retrieval_disabled true
+```
+
+For mounted team brains:
+```bash
+gbrain mounts trust-frontmatter team-brain-id  # opt this mount into frontmatter overrides
+gbrain mounts disable team-brain-id            # toggle off without removing
+```
+
+### Tier ladder — what each search mode gets
+
+| Mode | Wrapper | Per-query cost | One-time backfill |
+|------|---------|----------------|-------------------|
+| `conservative` | none | $0 | $0 |
+| `balanced` (default) | title-only prefix | $0 (string concat) | $0 (current text-embedding-3 calls reused) |
+| `tokenmax` | per-chunk Haiku synopsis | $0 (one-time only) | ~$1-5 per 10K pages, ~17h at Anthropic's default Haiku rate limit |
+
+The wrapper is asymmetric: chunks get the context prefix when going into the embed call, but queries stay clean. Voyage + ZeroEntropy distinguish `inputType: 'query'` from `'document'` natively, so this works correctly; OpenAI symmetric users still benefit from document-side orientation.
+
+### What you'd see in a concrete example
+
+A page titled "Acme Corp Series A" with a chunk that reads `raised $3M from Fund A in 2024`:
+
+| Stored in DB (`content_chunks.chunk_text`) | What the embedder saw |
+|--------------------------------------------|----------------------|
+| `raised $3M from Fund A in 2024` (canonical, unchanged) | `<context>Acme Corp Series A\n</context>\nraised $3M from Fund A in 2024` |
+
+Search snippets, full-text search, the reranker, and debug output all read the canonical chunk_text. Only the embedding vector reflects the wrapped form. This separation is the load-bearing invariant of the wave (D20-T1).
+
+### Cache invalidation — how the two-layer gate works
+
+```
+WRITE PATH (any pages mutation)
+  INSERT or UPDATE pages → trigger fires
+    INSERT → row gets generation = MAX(generation) + 1
+    UPDATE → if (body/title/type/page_kind/content_hash/etc IS DISTINCT FROM)
+             NEW.generation = OLD.generation + 1
+
+STORE PATH (query-cache.ts:store)
+  SELECT id, generation FROM pages WHERE id = ANY($result_page_ids)
+  + SELECT MAX(generation) FROM pages
+  → stamp BOTH per-page snapshot AND corpus bookmark on the cache row
+
+LOOKUP PATH (query-cache.ts:lookup) — TWO-LAYER
+  Layer 1 (cheap): (SELECT MAX(generation) FROM pages) <= stored_bookmark
+                   O(log N) via pages_generation_idx
+  Layer 2 (per-page): jsonb_each + LEFT JOIN pages
+                      page deleted → invalidate
+                      page bumped → invalidate
+                      pre-v0.40.3.0 rows with empty {} snapshot → vacuously valid
+```
+
+### Things to watch
+
+- **Migration v90 + v91**. v90 (renumbered from v0.40.3.0's original v81 on master merge) adds the 5 contextual retrieval columns. v91 adds `pages.generation BIGINT`, `query_cache.max_generation_at_store BIGINT`, the trigger, and the `pages_generation_idx` btree. All NULL-tolerant or have safe defaults; existing rows keep working unchanged.
+- **KNOBS_HASH_VERSION 3 → 5**. Bumped past 4 (claimed by salem's v0.40.4 graph signals work) to keep cache-row shape collisions impossible across sibling waves. Existing v=3 cache rows become unreachable on first re-query after upgrade (one-time miss spike).
+- **Chunker version 2 → 3** signals the post-upgrade reembed sweep that every markdown page needs to be re-embedded through the new wrapper path. Chunk boundaries themselves are unchanged from v2.
+- **Race fix folded in (D24)**: the long-standing v0.35.x NULL→non-NULL upsert race between concurrent embed workers is finally closed. Two writers racing on the same chunk now let the fresher `embedded_at` win instead of last-writer-wins.
+
+### What we caught and fixed before merging
+
+The wave went through two rounds of /plan-eng-review and one /codex outside-voice review on top of the original v0.40.3 codex pass. The fresh codex round caught EIGHT genuine bugs in the deltas, all absorbed before code landed:
+
+- **Trigger allow-list too narrow.** Original plan watched 6 columns (body/frontmatter/compiled_truth/timeline/deleted_at/contextual_retrieval_mode). Codex pointed out that title, type, page_kind, and corpus_generation are all user-visible — silently NOT bumping on those would serve stale search results for title edits. Widened to 10 columns including content_hash as the canonical "content changed" signal.
+- **BEFORE UPDATE missed INSERTs.** The original trigger fired BEFORE UPDATE only. The v0.38 ingest_capture handler uses `INSERT ... ON CONFLICT DO UPDATE`, so fresh slugs took the INSERT path and silently never bumped MAX(generation). Cache rows stored before a new page existed would never invalidate. Fixed: trigger now fires BEFORE INSERT OR UPDATE, and the INSERT branch sets generation = COALESCE(MAX, 0) + 1 explicitly.
+- **Migration version collision risk.** Master shipped v82-v88 across v0.38/v0.39 while v0.40.3.0 was off-master. Our v81 (contextual_retrieval_columns) collided with master's. Plan: rename to v89. Codex caught that `garrytan/v0.40.2.0-trajectory-routing` already reserved v89 for `facts_event_type_column`. Re-renumbered to v90; new trigger work at v91.
+- **KNOBS_HASH_VERSION collision with salem.** Both our wave and salem's v0.40.4 graph-signals wave wanted v=4. Per D8 we bumped to v=5 so cache rows from either wave can't accidentally serve the other.
+- **D3 regression test too weak.** Original plan asserted ingest_capture bumps generation on existing slugs only. Codex pointed out the INSERT path (codex #4) ALSO needs explicit coverage. T11 test now exercises both paths + idempotent re-capture.
+- **v0.38 provenance columns.** ingested_via/ingested_at/source_uri/source_kind are returned by ingest_capture but not written to pages. If a future master change wires them into putPage, the trigger allow-list would silently miss content edits via those columns. Verified at implementation time; allow-list left at the current 10 columns.
+- **Index shape wrong.** Original plan said `(generation DESC)`. Codex pointed out plain `(generation)` btree is backward-scannable for MAX. Simplified.
+- **One missing master commit.** Plan said 5 commits; master was actually 6 commits ahead via v0.39.2.0 autopilot/cycle-lock wave. Adjusted Phase 1 expectations.
+
+### Itemized changes
+
+- **Migration v90** (`src/core/migrate.ts`): renamed from v0.40.3.0's original v81 to clear master's v82-v88 reservations. 5 additive columns wiring the three-tier wrapper ladder.
+- **Migration v91** (NEW): `pages.generation BIGINT` + `query_cache.max_generation_at_store BIGINT` + `bump_page_generation_fn` trigger (BEFORE INSERT OR UPDATE with 10-column content allow-list) + `pages_generation_idx` btree via CONCURRENTLY on Postgres / plain CREATE INDEX on PGLite. `transaction: false` matches the v14 pages_updated_at_index pattern.
+- **Schema mirrors** (`src/schema.sql`, `src/core/pglite-schema.ts`): pages + sources + trigger DDL + index updated.
+- **Bootstrap probes** (`src/core/{pglite,postgres}-engine.ts`): forward-reference checks added for all 5 v90 columns + pages.generation per the established v0.22.6.1 pattern. `test/schema-bootstrap-coverage.test.ts` REQUIRED_BOOTSTRAP_COVERAGE extended.
+- **New pure modules** (`src/core/`): `remediation-step.ts` (canonical RemediationStep type + makeRemediationStep factory + canonical-JSON idempotency key per codex D12 Bug 2), `search/query-cache-gate.ts` (two-layer cache gate helpers + SQL fragment), `search/mode-switch-ux.ts` (transition summarizer + worker probe + Minion submission).
+- **query-cache.ts** lookup() / store() rewrites: two-layer gate embedded in the lookup SQL; store() captures the page_generations snapshot + max_generation_at_store bookmark via the new buildPageGenerationsSnapshot helper. KNOBS_HASH_VERSION 4 → 5 (per D8 sequencing behind salem's pending v=4).
+- **config.ts hook**: `gbrain config set search.mode <X>` captures the OLD mode, calls setConfig, then invokes runModeSwitchUx with TTY + non-TTY + GBRAIN_NO_MODE_SWITCH_UX awareness. Honors `--yes` for automation. Best-effort: UX failures never break a config write that already persisted.
+- **mounts.ts**: 4 new verbs (enable / disable / trust-frontmatter / untrust-frontmatter) sharing the runSetMountFlag helper. MountEntry interface extended with `trust_frontmatter_overrides?: boolean` (default false; mounts opt in explicitly). loadMounts projection threads the field through. GBRAIN_MOUNTS_PATH env override added to both `mounts.ts` and `brain-registry.ts` getMountsPath() so tests don't fight libuv's cached homedir().
+- **sources.ts**: `set-cr-mode <id> <mode>` verb with isCRMode validation, "unset"/"default"/"" as the clear path, missing-source loud rejection with paste-ready `gbrain sources list` hint (closes the idempotent-pebble Failure Modes critical gap).
+- **brain-score-recommendations.ts**: Remediation lifted into the new src/core/remediation-step.ts module. Re-exports + back-compat alias preserved so existing callers keep compiling.
+- **doctor.ts**: Check.remediation field typed to RemediationStep[]. integrity + sync_failures checks emit RemediationSteps via makeRemediationStep when the warn fires. sync-skip-failed deliberately NOT emitted per codex D12 Bug 3 (auto-skip hides data loss).
+- **jobs.ts**: 3 new Minion handlers registered (lint-fix, integrity-auto, sync-retry-failed). Thin wrappers around already-shipping CLI commands; NOT in PROTECTED_JOB_NAMES (idempotent, no shell exec, MCP-safe).
+- **import-file.ts**: wraps chunks at embed time (D20-T1 separation), stamps the two CR-state columns alongside putPage.
+- **Race fix** (D24): `postgres-engine.ts` + `pglite-engine.ts` upsertChunks use `embedded_at` to break NULL→non-NULL ties. Closes the long-standing v0.35.x TODO.
+- **Mode bundle field** (`src/core/search/mode.ts`): `contextual_retrieval: CRMode` per tier + `contextual_retrieval_disabled` kill switch.
+
+### For contributors
+
+7 new test files (1093 LOC) + 5 extended test files:
+- `test/query-cache-gate.test.ts` (15 cases: pure validator branches + PGLite-backed snapshot builder + SQL shape regression).
+- `test/mode-switch-ux.test.ts` (18 cases: 5-cell transition matrix + 3-branch worker probe + 6-case content-stable idempotency-key invariance).
+- `test/mounts-cli.test.ts` (5 new cases: enable/disable cycle, trust/untrust cycle, missing-mount rejection, host rejection, idempotent enable).
+- `test/sources-set-cr-mode.test.ts` (10 cases: happy path × 3 modes, unset path × 2, invalid mode rejection, missing source rejection, missing args, round-trip preserves other fields).
+- `test/remediation-step.test.ts` (17 cases: canonical-JSON determinism, idempotency_key shape + invariance, makeRemediationStep factory, back-compat alias).
+- `test/e2e/cache-gate-pglite.test.ts` (6 cases: store→HIT, content UPDATE→MISS, INSERT new page→HIT codex #4 case, legacy row→HIT IRON-RULE, soft-delete→MISS, multi-page partial bump→MISS).
+- `test/e2e/capture-generation-regression.test.ts` (3 cases: INSERT path bumps MAX, UPDATE path bumps generation, idempotent re-capture does NOT bump).
+
+## To take advantage of v0.40.3.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Your agent reads `skills/migrations/v0.40.3.0.md` the next time you interact with it.**
+   The migration is mostly mechanical (schema + bootstrap probes); no agent-side action required beyond the optional `--mode tokenmax` opt-in.
+3. **Verify the outcome:**
+   ```bash
+   gbrain doctor
+   gbrain search "your favorite query"  # should hit cache on the 2nd run
+   ```
+4. **If you want to opt up to tokenmax (per-chunk Haiku synopsis):**
+   ```bash
+   gbrain config set search.mode tokenmax
+   # Mode-switch banner fires with cost preview + offers reindex submission.
+   ```
+5. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+   This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
+
+## [0.40.2.0] - 2026-05-22
+
+**gbrain now uses the typed-claim timeline it's been quietly building to ground answers about what changed and when.** Ask `gbrain think` "when did Marco last switch jobs" or "what was the ARR in March" and the answer comes back rooted in a real chronological timeline of the metric facts your brain already extracted via the `extract_facts` cycle phase. The feature is on by default; flip `think.trajectory_enabled=false` to opt out.
+
+The same plumbing lands in the LongMemEval benchmark, with a methodology change you should know about: the benchmark harness now runs a Haiku preprocessing step over each haystack session before retrieval, populating the typed-claim substrate inline so trajectory routing has data to work with. This means the temporal-reasoning number we publish is "gbrain + Haiku-preprocess pipeline" vs "gbrain alone" — NOT directly comparable to the published LongMemEval baselines without that disclosure. We chose the contamination cost openly because the substrate's real production value lives in `gbrain think`, not the benchmark. The per-question JSON envelope stamps `methodology_note: "extractor=haiku-preprocess-full-haystack-v1"` so downstream readers see the preprocessing step is in the pipeline.
+
+## To take advantage of v0.40.2.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Your `gbrain think` calls start getting trajectory blocks on temporal/knowledge-update questions immediately** — no agent re-read needed. The feature reads from your existing `facts` table (the one `extract_facts` cycle phase has been populating); production users who already run that phase get the benefit at $0.
+3. **Verify the outcome:**
+   ```bash
+   gbrain think "when did Marco last switch jobs"  # spot-check a temporal question
+   GBRAIN_THINK_DEBUG=1 gbrain think "what's the current ARR"  # see the prompt with the trajectory block
+   ```
+4. **Opt out if you regress:**
+   ```bash
+   gbrain config set think.trajectory_enabled false
+   ```
+5. **If any step fails or the numbers look wrong,** please file an issue: https://github.com/garrytan/gbrain/issues with output of `gbrain doctor` and contents of `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+### Itemized changes
+
+**Substrate (migration v89 `facts_event_type_column`):**
+- `facts` table gains a nullable `event_type TEXT` column so the v0.35.7 typed-claim substrate can carry event-shaped rows (`event_type='meeting'`, `'job_change'`, `'location_change'`) alongside metric-shaped rows (`claim_metric` / `claim_value` etc). Temporal-reasoning LongMemEval questions ask about event chronology that the metric-only shape couldn't capture.
+- `TrajectoryPoint.event_type: string | null` projected by both PGLite and Postgres `findTrajectory` paths.
+- `TrajectoryOpts.kind?: 'metric' | 'event' | 'all'` filter added (default `'all'`). Existing callers (`founder-scorecard`, `eval-trajectory`) pass `kind: 'metric'` explicitly for call-site clarity — no behavior change, since both already defensively skipped NULL-metric rows in their per-metric math.
+- New `src/core/trajectory-format.ts` — shared `formatTrajectoryBlock(points, entitySlug, opts)` consumed by both `gbrain think` (production) and the LongMemEval harness (benchmark). Groups by `(metric ?? event_type)`, per-metric cap 20, total cap 100, knowledge_update intent annotates value-change rows with `(superseded prior)`.
+- `INJECTION_PATTERNS` in `src/core/think/sanitize.ts` extended to escape `</trajectory>`, `<trajectory ...>` open tags, and attribute injection. Adversarial fact text in extracted claims can't break out of the data envelope to inject instructions.
+
+**`gbrain think` integration (default ON):**
+- New `src/core/think/intent.ts` — pure `classifyIntent(question)` returns `'temporal' | 'knowledge_update' | 'other'`. Regex-first, no LLM call. The `'other'` fast path short-circuits with zero SQL.
+- New `src/core/think/entity-extract.ts` — `extractCandidateEntities(question, retrievedSlugs)` pulls high-precision candidates from retrieved entity-prefix slugs (`people/`, `companies/`, `organizations/`) and medium-precision noun phrases from the question. Stop-word boundaries + leading-verb stripper handle "When did I last meet Marco" → `marco` cleanly.
+- `buildThinkUserMessage` extended with a `trajectory?: ThinkTrajectoryBlockOpts` slot that honors BOTH existing prompt orderings (calibration mode: retrieval → calibration → trajectory → question; default mode: question → retrieval → trajectory → instruction). No third ordering invented.
+- `runThink` orchestrates intent → entity → `findTrajectory` (5s `Promise.race` timeout per candidate, concurrency cap 3) → formatted block. The MCP `think` op handler extracts `sourceScopeOpts(ctx)` to scalar `sourceId`/`allowedSources`/`remote` fields on `RunThinkOpts` so federated-read OAuth clients can't see trajectory rows outside their source scope.
+- New config key `think.trajectory_enabled` (default `true`). Flip to `false` to bypass entirely. Any error in the trajectory path degrades to "no block injected" + `TRAJECTORY_INJECTION_FAILED` warning — the think call itself never crashes from trajectory.
+
+**LongMemEval inline Haiku extractor:**
+- New `src/eval/longmemeval/extract.ts` — `extractAndInsertClaims()` populates the benchmark brain's `facts` table inline at import time. Single Haiku call per session with content-hash cache (cuts a 3-iteration benchmark run from $1.50 to $0.50 when sessions repeat across questions, as they do in LongMemEval).
+- Per-question alias map — `"Marco"` + `"Marco Smith"` + `"marco"` in the SAME question collapse to one canonical slug via first-mention-wins. Fresh map per question; aliases never leak across.
+- Fail-open: malformed JSON, Haiku throw, insert collision, empty array — all return `inserted: 0` without throwing. One bad session never kills the per-question loop.
+- `getCacheStats()` writes the empirical hit rate to stderr per benchmark run.
+
+**LongMemEval intent routing + methodology disclosure:**
+- New `src/eval/longmemeval/intent.ts` — prefers the dataset's `question_type` field (LongMemEval ships labels like `temporal-reasoning`, `knowledge-update`, `single-session-user`) before falling back to the SHARED regex set imported from `src/core/think/intent.ts`. Single source of truth — think and longmemeval cannot drift.
+- `runOneQuestion` routes temporal/knowledge_update intents through the shared `extractCandidateEntities` helper → `findTrajectory` → splice into the answer-gen prompt before the retrieved-sessions block.
+- New CLI flag `--no-trajectory` bypasses BOTH the extractor and the intent routing. Used by the measurement protocol to baseline default-on vs no-trajectory across 3 seeds per condition with paired-bootstrap CI.
+- JSON envelope adds 5 per-question fields when trajectory routing is on: `intent`, `trajectory_points`, `entity_resolved`, `resolution_source`, `methodology_note`. The methodology_note is also written to stderr at run completion. Honest disclosure of the preprocessing step.
+- Resolution-source gate divergence (documented): the production `gbrain think` path skips `fallback_slugify` resolutions (avoid querying invented slugs); the LongMemEval harness accepts them because the extractor and the lookup both go through the same slugify path on free-form names, so they cohere. Applying the think-path gate to the harness would permanently block trajectory injection on the benchmark.
+
+**Test coverage:**
+- 81 new tests across 9 files. All hermetic (no DATABASE_URL, no API keys) except where DATABASE_URL gates real-Postgres parity coverage.
+- `test/trajectory-format.test.ts` (17): grouping, caps, sanitization, supersession annotation, determinism, provenance, text-cap, adversarial `</trajectory>` escape.
+- `test/engine-parity-event-type.test.ts` (6): PGLite round-trip of the column + kind filter matrix.
+- `test/regressions/v0_40_2_0-trajectory-backcompat.test.ts` (4): pins byte-identical `computeFounderScorecard` + `computeTrajectoryStats` output with and without event rows in the input — the critical contract that event-only rows ride through invisibly to existing per-metric callers.
+- `test/think-intent.test.ts` (14): temporal, KU, other, precedence (KU wins when both match), defensive non-string inputs.
+- `test/think-entity-extract.test.ts` (10): retrieved-slug source, noun-phrase source, stop-word stripping, leading-verb stripping, dedup across sources, 5-candidate cap.
+- `test/think-trajectory-injection.test.ts` (7): temporal intent injection with superseded-prior annotation, `'other'` short-circuit, `withTrajectory: false` bypass, `think.trajectory_enabled=false` bypass, empty-trajectory skip, `findTrajectory` throw caught by `Promise.allSettled`, TRAJECTORY_INJECTED warning count.
+- `test/longmemeval-extract.test.ts` (13): JSON-repair adversarial inputs, alias collapsing within and across sessions in the same question, per-question reset on TRUNCATE, content-hash cache hit/miss with reported hit-rate format, fail-open paths.
+- `test/longmemeval-intent.test.ts` (9): dataset question_type → Intent mapping for all six LongMemEval labels, dataset label trumps question-text signal, unknown labels fall through to regex.
+- `test/longmemeval-trajectory-routing.test.ts` (4): end-to-end through `runEvalLongMemEval` with both clients stubbed — trajectory block lands in answer-gen prompt for temporal intent, absent for `'other'`, `--no-trajectory` bypasses, methodology_note stamped on every routed row, perf gate preserved.
+
+### Plan + reviews
+
+Plan file at `~/.claude/plans/system-instruction-you-are-working-crystalline-owl.md` carries the full design rationale, the CEO/Eng/Codex review history (3 review passes, all CLEARED), the measurement plan (3 seeds per condition + paired-bootstrap CI), and the hand-verification gate list. Codex flagged 18 findings during outside-voice review; 6 load-bearing ones folded as design decisions (alias-map wording, `resolveEntitySlugWithSource` resolution_source signal, prompt-placement preserving both calibration AND default ordering, INJECTION_PATTERNS extension for `</trajectory>`, 5s findTrajectory timeout + 10s extractor timeout, doctor check deferred to v0.40.1+, real-LLM spot-check added, success metric broadened). The benchmark methodology contamination was the load-bearing decision — accepted with explicit CHANGELOG + JSON-envelope disclosure.
+
+
+## [0.40.1.0] - 2026-05-22
+
+**Eval infrastructure that catches retrieval regressions before merge and proves answer-quality wins after ship.**
+
+Three things changed about how gbrain measures itself. First, when you run the LongMemEval benchmark, you can now see per-question-type recall in machine-readable form (a single flag prints something like "single-session-user: 94.7%, multi-session: 100%"). Before this release that number existed but only as a fleeting stderr line — you couldn't pipe it into a script or compare it across runs. Second, any PR that touches the search code now runs a tiny hermetic test that asks "would this change rerank our known queries?" Twelve hand-curated queries with known expected results live in a fixture; the test runs them through the new ranking and fails the PR if the top-1 match rate drops below 80% or recall@10 drops below 85%. No API keys, no Postgres, no flakiness — just `bun test` in the standard PR shard. Third, you can run cross-modal quality scoring across a whole LongMemEval slice in one command (`gbrain eval cross-modal --batch run.jsonl --limit 10 --cycles 1`) with built-in cost guardrails so you can't accidentally spend $50 on a quality check.
+
+The headline number for the user: agents that touch retrieval can now ship knowing whether they regressed real query-answer quality, not just whether tests pass.
+
+### How to turn it on
+
+```bash
+# 1. Per-question-type breakdown after any LongMemEval run.
+gbrain eval longmemeval ~/datasets/longmemeval_s.jsonl \
+  --by-type --output /tmp/run.jsonl
+tail -1 /tmp/run.jsonl | jq .   # summary line with recall_by_type
+
+# 2. The qrels gate runs automatically on every PR touching src/core/search/**.
+#    No setup needed. To run locally:
+bun test test/eval-replay-gate.test.ts
+
+# 3. Cross-modal batch over LongMemEval output (real LLM cost ~$0.70 default).
+gbrain eval cross-modal --batch /tmp/run.jsonl \
+  --limit 10 --cycles 1 --concurrent 3 --max-usd 5 --json
+
+# 4. Opt-in nightly quality probe via autopilot (scheduler wiring deferred to
+#    v0.41+; phase is callable in isolation today).
+gbrain config set autopilot.nightly_quality_probe.enabled true
+```
+
+### Numbers that matter
+
+| Surface | Before | After |
+|---|---|---|
+| Per-question-type R@k | stderr-only, lost on next run | JSONL summary line, scriptable, resume-safe |
+| Search PR gate | none (silent regressions possible) | hermetic qrels gate on every PR shard |
+| Cross-modal batch | single-task only; manual loop needed | `--batch FILE` with semaphore + cost cap |
+| Default batch cost ceiling | implied | `--max-usd 5` refuses without `--yes` |
+| Nightly quality probe | not present | opt-in autopilot phase + doctor check + audit JSONL |
+
+### Things to watch after upgrade
+
+- `gbrain doctor` will now show `nightly_quality_probe_health: disabled (opt-in)` until you set the config flag. This is informational, not a warning.
+- The LongMemEval `--by-type` summary is appended as a NEW JSON line at the end of the output. Existing consumers (LongMemEval's `evaluate_qa.py`) ignore unknown fields, so your existing pipelines keep working unchanged.
+- The qrels gate uses synthetic queries with placeholder names (alice-example, widget-co-example, etc.). When a real ranking change moves expected slugs, you refresh `test/fixtures/eval-baselines/qrels-search.json` and add a `Why:` line to the commit body so future maintainers understand the drift.
+- Autopilot scheduler wiring for the nightly probe is deferred to v0.41+ — the phase is callable in isolation today via the DI surface; cycle-loop dispatcher integration is filed as a follow-up TODO.
+
+### Itemized changes
+
+#### `gbrain eval longmemeval --by-type`
+
+- Every per-question JSONL row now includes `question: string`, `question_type: string`, and (when ground truth is available) `recall_hit: boolean`. Additive — `evaluate_qa.py` and other consumers ignore unknown fields.
+- New `--by-type` flag emits a final `{schema_version:1, kind:"by_type_summary", recall_by_type:{...}, aggregate:{...}}` line as the LAST line of the output.
+- Resume-safe via three new exported helpers (`buildByTypeSummary`, `emitByTypeSummary`, `seedRecallByTypeFromFile`): the summary is rebuilt from existing file rows on `--resume-from` runs so the final aggregate covers ALL resumed questions, and any prior summary at the tail is replaced rather than appended.
+- New `--by-type-floor F` (range [0,1]) exits non-zero with a per-type breach stderr line when any `question_type` rate falls below floor. Default unset = informational only.
+- Empty-bucket guard: `aggregate.rate` is `null` (not NaN) when no questions had ground truth, so downstream JSON consumers don't trip.
+- Pinned by 5 new cases in `test/eval-longmemeval.test.ts` covering question-field presence, with/without flag emission, resume-replace at file tail with cumulative aggregation across runs, and the pure `buildByTypeSummary` function.
+
+#### Hermetic qrels retrieval gate
+
+- New committed fixture at `test/fixtures/eval-baselines/qrels-search.json` with 12 hand-curated queries using placeholder names only.
+- New unit test at `test/eval-replay-gate.test.ts` (NOT under `test/e2e/` — the unit-shard CI matrix runs every PR via `bun test`; `test/e2e/` is fixed-file). Uses the canonical PGLite block from CLAUDE.md test-isolation rules and basis-vector embeddings (the `basisEmbedding(idx)` pattern from `test/e2e/search-quality.test.ts:23-28`) so retrieval is hermetic — no API keys, no `DATABASE_URL`, fully deterministic.
+- For each query, asserts `top1_match_rate >= 0.80` AND `recall_at_10 >= 0.85`. Env-overridable floors via `GBRAIN_REPLAY_GATE_TOP1_FLOOR` / `GBRAIN_REPLAY_GATE_RECALL_FLOOR`.
+- When the gate trips, the test surfaces per-query results to stderr (HIT/miss + recall) so the operator sees exactly which queries regressed without re-running.
+- Pinned by 5 cases including a privacy-grep regression guard that fails on any real-name reintroduction.
+
+#### `gbrain eval cross-modal --batch`
+
+- Existing single-task `gbrain eval cross-modal` grows new flags: `--batch <jsonl> [--limit N] [--concurrent N] [--max-usd FLOAT] [--yes]`. Mutually exclusive with `--task` (fail-fast usage error). One canonical home for cross-modal eval — no new subcommand.
+- Reads LongMemEval-shape JSONL output, filters `kind: "by_type_summary"` rows automatically, slices to `--limit` (default 10), and fans out via semaphore-bounded loop.
+- New inline `runWithLimit<T>(items, limit, fn)` semaphore primitive (exported for unit tests): default `--concurrent 3` × 3 model slots per question = max 9 simultaneous API calls. Below tier-1 rate limits on Anthropic, OpenAI, and Google.
+- Pre-flight cost estimate refuses if `> --max-usd` (default 5.00 USD) without `--yes`. Cron / CI callers must pass `--yes` explicitly to bypass.
+- Per-question receipts land in a per-batch tempdir and are deleted at end of run so `~/.gbrain/eval-receipts/` doesn't accumulate junk. The summary receipt inlines per-question verdicts as JSON, not file paths, so the audit trail is self-contained.
+- Exit precedence (fail-loud convention; new batch-level policy, NOT inherited from `aggregate.ts`): ERROR > FAIL > INCONCLUSIVE > PASS. Any per-question runtime error → exit 2 even if other questions passed.
+- New `runEvalCrossModal(args, opts?: {runEval?: typeof runEval})` DI seam mirrors the eval-longmemeval pattern. Tests pass a stub `runEval` returning deterministic `RunEvalResult`; gateway availability check is also skipped when `opts.runEval` is provided so unit tests don't need API keys.
+- Pinned by 17 cases in `test/eval-cross-modal-batch.test.ts` (semaphore unit tests + batch flow + exit precedence + privacy filter + mutex + budget refuse + by-type-summary filter + parser strictness).
+
+#### Nightly quality probe (opt-in)
+
+- New autopilot phase at `src/core/cycle/nightly-quality-probe.ts` that composes `eval longmemeval` + `eval cross-modal --batch` into a 24h-cadenced quality check.
+- New audit JSONL writer at `src/core/audit-quality-probe.ts` writing to `~/.gbrain/audit/quality-probe-YYYY-Www.jsonl` (ISO-week rotation; mirrors `audit-slug-fallback.ts`; honors `GBRAIN_AUDIT_DIR`). One event per run with outcome, exit code, pass/fail/inconclusive/error counts, est_cost_usd, fixture_sha8, and optional detail.
+- Pure `shouldRunNightly(now, recentEvents, windowMs?)` function gates the 24h rate limit so the audit-log read is the only state and tests can drive any cadence.
+- Full DI surface via `NightlyProbeDeps` (`isEnabled`, `hasEmbeddingProvider`, `resolveMaxUsd`, `resolveRepoRoot`, `runLongMemEval`, `runCrossModalBatch`, `now`). Tests stub every external effect — no PGLite, no real LLM calls, no env mutation outside `withEnv()`.
+- New 10-question placeholder fixture at `test/fixtures/longmemeval-nightly.jsonl` using only synthetic names. Distinct from the existing 5-question `longmemeval-mini.jsonl` (unit-test fixture) so the nightly probe has consistent regression signal.
+- New `nightly_quality_probe_health` check in `gbrain doctor`: SKIPPED with paste-ready enable command when disabled; OK with timestamp when all PASS in last 7 days; WARN with per-outcome counts when any FAIL / ERROR / BUDGET_EXCEEDED. The check is also exposed as the pure `computeNightlyQualityProbeHealthCheck(probeEnabled, events)` helper for direct unit testing.
+- Default DISABLED — opt-in via `gbrain config set autopilot.nightly_quality_probe.enabled true`. New users running `gbrain init` should NOT discover background API spend.
+- Real expected cost: ~$0.35/night ≈ $10.50/month. Worst-case under the default $5 cap: $150/month.
+- Pinned by 21 cases in `test/nightly-quality-probe.test.ts` covering the rate-limit pure function, every outcome branch (disabled / no-embedding-key / rate-limited / pass / fail / runtime-error / missing-fixture), and all 7 branches of the doctor check.
+- Autopilot scheduler wiring deferred to v0.41+ — the phase is callable in isolation today; cycle-loop dispatcher integration filed in TODOS.md as a ~3-hour follow-up.
+
+#### For contributors
+
+- DI seam consistency: `runEvalCrossModal(args, opts?)` now mirrors `runEvalLongMemEval(args, opts?)`. Both let tests stub the heavy backend without `mock.module` (which would force `*.serial.test.ts` quarantine under the test-isolation rules).
+- Cost-bounding pattern: every new long-running command in this wave (--batch, nightly probe) refuses to start past a configurable USD cap without explicit `--yes`. Consistent across the surface.
+
+## To take advantage of v0.40.1.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Your agent reads the docs the next time you interact with it.** No schema migration in this release — Track D is pure tooling. CLAUDE.md's "Key files" section grew four annotations; `bun run build:llms` regenerated `llms.txt` + `llms-full.txt` in the same commit.
+3. **Verify the outcome:**
+   ```bash
+   bun test test/eval-replay-gate.test.ts        # hermetic qrels gate green
+   bun test test/eval-longmemeval.test.ts        # --by-type cases green
+   bun test test/eval-cross-modal-batch.test.ts  # --batch cases green
+   bun test test/nightly-quality-probe.test.ts   # nightly probe DI cases green
+   gbrain doctor --json | jq '.checks.nightly_quality_probe_health'
+   ```
+4. **Optionally enable the nightly probe** (real API cost ~$10.50/month expected, $150/month worst-case under the default $5/run cap):
+   ```bash
+   gbrain config set autopilot.nightly_quality_probe.enabled true
+   ```
+   Skip if you don't want background API spend.
+5. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+   This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
+## [0.40.0.0] - 2026-05-17
+
+**Voice agent reference lands — Mars + Venus personas, WebRTC-first, copy-into-your-repo not stuck-in-gbrain.**
+**New skillpack paradigm: gbrain ships REFERENCE content the install agent copies into your repo, where YOU own the edits.**
+
+This release lands `agent-voice` — a reference voice agent (Mars + Venus personas, WebRTC-first browser client, optional Twilio adapter) AND a new skillpack-install paradigm. The voice content is ~5,000 LOC of working code that does NOT live in your `~/.gbrain/skills/` managed block. Instead, `gbrain integrations install agent-voice --target <your-repo>` COPIES it into your host agent repo (e.g. `~/git/your-agent-repo/services/voice-agent/`), and from there it's user-owned, mutable, locally extensible. Future updates are diff-and-propose against per-file SHA-256 hashes, not blind overwrite.
+
+This is the first recipe to use `install_kind: copy-into-host-repo`. The legacy `local-managed` install path is unchanged for every other recipe.
+
+### The four numbers that matter
+
+| Metric | Before | After | Δ |
+|---|---|---|---|
+| Voice-agent content in gbrain | 0 LOC (only a narrative recipe) | ~5,000 LOC reference + 3 SKILL.md + tests | +5,000 |
+| Mars/Venus persona prompts shipped | 0 | 2 (scrubbed; PII-impossible by construction) | +2 |
+| Privacy guard files | scripts/check-privacy.sh (broad) | + scripts/check-no-pii-in-agent-voice.sh (agent-voice scope) | +1 |
+| New install paradigm | "ship to ~/.gbrain/skills/" only | "copy into your host repo" available | +1 |
+
+### What `gbrain integrations install agent-voice` does
+
+1. Reads `recipes/agent-voice/install/manifest.json` — src → target file map.
+2. Validates your target repo (must exist, must have `.git`, must NOT be gbrain itself or a parent of it, no existing files at any target path).
+3. Computes SHA-256 of each source file as it copies, writes `<target>/services/voice-agent/.gbrain-source.json` for future `--refresh`.
+4. Appends three resolver rows to your `RESOLVER.md` or `AGENTS.md`: `voice-persona-mars`, `voice-persona-venus`, `voice-post-call`.
+5. Prints next-step instructions: set `OPENAI_API_KEY`, optionally implement your own context-builder against the documented contract, then `bun run start`.
+
+### What ships in the voice agent
+
+- **Mars persona** (`Orus` voice) — dual-mode: SOLO (introspective thought partner) + DEMO (impressive tool-driven showman). Mode detection from conversational signals.
+- **Venus persona** (`Aoede` voice) — sharp executive assistant; 1-3 sentences max; English-only; sub-second turn-taking.
+- **WebRTC-first browser client** at `/call`. Production load installs ZERO test instrumentation. Append `?test=1` for the E2E namespace (`window._gbrainTest`) + Web Audio API tee → MediaRecorder capture of response audio.
+- **Read-only tool router** with an 8-op allow-list (`search`, `query`, `get_page`, `list_pages`, `find_experts`, `get_recent_salience`, `get_recent_transcripts`, `read_article`). Write ops (`put_page`, `submit_job`, `file_upload`, `delete_page`, `shell`) are permanently denylisted — even adding them to a local override CANNOT enable them.
+- **Persona-aware prompt builder** — identity-first composition, Unicode sanitization for OpenAI Realtime API safety (em dashes, smart quotes, arrows → ASCII), live brain-context injection via operator-implemented `buildMarsContext` / `buildVenusContext`.
+- **Upstream-error classifier** for the E2E — soft-fails on HTTP 429/500/503 from OpenAI, hard-fails on plumbing bugs (`_audioSendCount === 0`).
+- **Three skills** with `routing-eval.jsonl` fixtures, ready to drop into your host repo's resolver.
+
+### What ships in gbrain
+
+- `src/commands/integrations.ts` extended with the `install <recipe-id>` subcommand (the discriminated `install_kind` route).
+- `scripts/check-no-pii-in-agent-voice.sh` wired into `bun run verify` — shape regex (phones, emails, SSN, JWT, bearer, credit card) + path patterns + operator-blocklist env var. Catches re-introduction of private names in `recipes/agent-voice/**` or `recipes/agent-voice.md`.
+- `scripts/import-from-upstream.sh` + `scripts/upstream-scrub-table.txt` — deterministic refresh from upstream voice-agent source (env-var-driven; no upstream-repo name in any shipped file).
+- New TypeScript types: `InstallKind`, manifest shape, install records — pinned by `test/integrations-install.test.ts` (11 cases).
+
+### What you ACTUALLY do to take advantage of v0.40.0.0
+
+```bash
+# 1. Upgrade gbrain (whatever your update path is).
+# 2. Run from your host agent repo or any dir:
+gbrain integrations install agent-voice --target $OPENCLAW_WORKSPACE   # or your repo path
+
+# 3. Set OPENAI_API_KEY in your host repo's .env
+echo "OPENAI_API_KEY=sk-..." >> $OPENCLAW_WORKSPACE/.env
+
+# 4. (Optional but recommended) Edit your context-builder
+$EDITOR $OPENCLAW_WORKSPACE/services/voice-agent/code/lib/context-builder.example.mjs
+# Contract: $OPENCLAW_WORKSPACE/services/voice-agent/code/lib/personas/context-builder.contract.md
+
+# 5. Run the host-side tests
+cd $OPENCLAW_WORKSPACE/services/voice-agent && bun install && bun run test
+
+# 6. Start the server
+cd $OPENCLAW_WORKSPACE/services/voice-agent && bun run start
+# → http://localhost:8765/call
+```
+
+### What this means for daily use
+
+The voice agent runs in YOUR repo, on YOUR cadence. When gbrain ships a new agent-voice reference (Mars gets multilingual after the eval lands; a new pipeline option B becomes available; a security patch in the tool router), you pull at YOUR schedule and run `gbrain integrations install agent-voice --target <repo> --refresh`. The refresh diffs your local copy against gbrain's reference and shows per-file disposition: identical, stale, locally-modified. You pick file-by-file. No silent overwrite of your edits.
+
+### Itemized changes
+
+#### Voice agent (new)
+- `recipes/agent-voice.md` registered recipe with `install_kind: copy-into-host-repo` frontmatter, WebRTC-first body, copy-paradigm explainer, install-subcommand invocation, production checklist.
+- `recipes/agent-voice/README.md` — paradigm doc + sibling-directory convention for future copy-into-host-repo recipes.
+- `recipes/agent-voice/code/` (~17 files) — scrubbed `mars.mjs`, `venus.mjs`, `personas.mjs` registry, `tools.mjs` allow-list router, `gbrain-client.mjs` stdio MCP client, `prompt.mjs` persona-aware builder, `server.mjs` minimal HTTP + WebRTC server, `public/call.html` with `?test=1` instrumentation + WebAudio-tee capture, `lib/upstream-classifier.mjs` for E2E failure triage, ported `audio-convert.mjs` / `gatekeeper.mjs` / `sessions.mjs` / `twilio-bridge.mjs` from upstream (PII-clean).
+- `recipes/agent-voice/skills/` — three SKILL.md skills with `routing-eval.jsonl` fixtures (voice-persona-mars, voice-persona-venus, voice-post-call).
+- `recipes/agent-voice/tests/unit/` — five host-side test suites (97 cases) covering persona registry, prompt-shape privacy guards, read-only allow-list, upstream-error classifier.
+- `recipes/agent-voice/install/` — manifest + refresh-algorithm spec + post-install hint for the install agent.
+
+#### Privacy + scrub infrastructure (new)
+- `scripts/check-no-pii-in-agent-voice.sh` — wired into `bun run verify`. Shape + path + env-driven operator blocklist.
+- `scripts/import-from-upstream.sh` + `scripts/upstream-scrub-table.txt` — deterministic refresh from upstream; placeholder-driven (env-var expanded at run time so no private names in checked-in files).
+- `recipes/agent-voice/code/lib/personas/private-name-blocklist.json` — single source of truth for the regex contract (shape categories + path patterns + env-var name); shared by the shell guard and the host-side `.mjs` prompt-shape tests.
+
+#### gbrain runtime (new src/ code)
+- `src/commands/integrations.ts` extended (~+150 LOC) with `install <recipe-id>` subcommand. New types: `InstallKind` discriminated union, `InstallManifest`, `InstalledFileRecord`, `GbrainSourceJson`. Path-traversal hardening mirrors the pattern from `src/core/operations.ts:validateUploadPath`. Refusal cases pinned by 11 test cases.
+- `recipes/twilio-voice-brain.md` (v0.8.1) — left in place; will be marked deprecated in a follow-up PR.
+
+#### Tests
+- `test/integrations-install.test.ts` — 11 gbrain-side cases (happy path, manifest shape, no upstream_repo field, resolver row appending, file modes, refusal cases for missing target, no-git target, gbrain-itself, overwrite, unknown recipe, dry-run).
+- `test/check-no-pii.test.ts` / `test/import-from-upstream.test.ts` — deferred to a fast-follow PR; the shell scripts are smoke-tested in the local dev loop.
+
+#### Also shipped in this PR (wave 2 — closes original deferred list)
+- E2E test suite — `tests/e2e/voice-roundtrip.test.mjs` (server + puppeteer + fake-audio + Whisper-judge; ~$0.10/run; env-gated on `AGENT_VOICE_E2E=1`) and `tests/e2e/voice-full-flow.test.mjs` (openclaw-driven install + roundtrip; ~$1-2/run; env-gated on `AGENT_VOICE_FULL_E2E=1`). Shared `lib/browser-audio.mjs` + `lib/whisper-judge.mjs`. Three-tier assertion (CONNECTION hard, NON-SILENT hard, SEMANTIC soft). Upstream errors soft-fail via the classifier.
+- Claw-test scenario `voice-agent-install/` with `BRIEF.md` + `scenario.json` (labeled BENCHMARK_FRICTION, `blocks_ship: false`) + `expected.json`.
+- LLM-judge persona evals: gateway-routed 3-model harness (Claude + GPT + Gemini) with 4-strategy JSON repair and 2/3-quorum aggregation. Five fixture sets (`mars-solo`, `mars-demo`, `venus`, `persona-routing`, `mars-multilingual`). Synthetic canonical baselines under `tests/evals/baseline-runs/canonical/` (agent-authored; live receipts gitignored).
+- DIY pipeline (Option B) `code/pipeline.mjs`: streaming Deepgram STT + Claude SSE with sentence-boundary TTS dispatch + Cartesia/OpenAI TTS, 20-turn history cap, exponential reconnect, 25s keepalives, four VAD presets, barge-in on `speechStart`. Modular adapters for swapping any stage.
+- `--refresh` mode in `gbrain integrations install`: classifies each file as unchanged-identical / unchanged-stale / locally-modified / source-deleted / host-deleted / new-in-manifest. Default policy preserves operator edits (`keep-mine`); `--auto take-theirs` overwrites; `--dry-run` previews. Transaction journal at `.gbrain-source.refresh.log`. 7 new test cases pin the classification + decisions.
+- Mars multilingual: persona prompt restores cross-lingual rule (Mandarin / Spanish / French / Japanese / Korean default to English but follow the speaker). New eval fixtures at `tests/evals/fixtures/mars-multilingual.jsonl` gate the claim.
+- `recipes/twilio-voice-brain.md`: deprecation banner pointing at `agent-voice.md`; will be removed in v0.41.
+
+#### For contributors
+- New paradigm `install_kind: copy-into-host-repo` is documented in `recipes/agent-voice/README.md`. Future recipes that want this shape follow the sibling-directory convention pinned there.
+- The deterministic import script + scrub table are the canonical refresh-from-upstream mechanism. Update the table; re-run the script; the PII guard fail-closes if anything slipped through.
+## [0.39.3.0] - 2026-05-22
+
+**`gbrain capture` now actually does what you expect: handles files with their own frontmatter cleanly, dedups identical text, rejects binary files, finds itself in `--help`, and tells you when something goes wrong instead of doing nothing.**
+
+A production smoke test against the v0.38.0.0 ingestion cathedral release turned up two real bugs and ten warnings, all in the new capture and ingest paths. The bugs were the kind that you only notice when you're using the feature for real: capturing a markdown file that already had `---` frontmatter at the top would stamp a SECOND frontmatter block above the user's, with `title: '---'` (the file's opening delimiter became the outer title). And POSTing to `/ingest` with no body at all returned a 500 HTML error page instead of a JSON envelope, because of a single TypeScript line that called `Buffer.from(JSON.stringify(undefined))` and crashed before the empty-body guard could fire.
+
+Beyond the bugs: capture wasn't listed in `gbrain --help`, `gbrain capture --help` printed only one generic line because of a missing entry in a set, the dedup hash included the capture timestamp so identical captures never actually deduplicated, binary files were silently captured as mojibake, `--source nonexistent` printed a raw Postgres FK violation, and brainstorm would hang silently on PgBouncer-restricted environments instead of saying "query was canceled."
+
+This release closes all 12 items in one wave with atomic per-finding commits.
+
+### How to upgrade
+
+```bash
+gbrain upgrade
+# All fixes are transparent. No manual migration steps. The new put_page
+# provenance columns (migration v81) shipped in v0.38.0.0 and are
+# already in your brain; this release populates them on every write
+# instead of leaving them null.
+```
+
+### Things you can now do
+
+- **Capture a file that already has frontmatter** without getting a doubled-frontmatter mess. The new merge logic respects your declared `title`, `type`, `captured_at`, `tags`, `description`, and any other key you set; capture only fills in the fields you left blank.
+- **See `capture`, `brainstorm`, and `lsd` listed in `gbrain --help`** under a new BRAIN section. They were implemented but invisible before.
+- **Run `gbrain capture --help`** and get the full flag documentation (the detailed HELP constant has existed for releases — it was just unreachable behind a generic short-circuit). All seven flags documented with the new behavior notes.
+- **`gbrain capture "same text"` twice in a row produces an identical `content_hash`.** The hash is now computed from the normalized body (whitespace + line endings + Unicode form), not the timestamp-bearing frontmatter. The daemon's 24h LRU dedup actually works.
+- **Capture a markdown file with CJK text, emoji, CRLF line endings, or a BOM** without any of those bytes getting mangled. Hash normalization is separate from stored-body preservation: the hash gets aggressive normalization for dedup correctness; the stored content keeps your bytes for round-trip fidelity.
+- **`gbrain capture --file binary.bin`** rejects with a friendly error instead of capturing 256 bytes of garbage as "text." Same protection on `--stdin` — `cat binary.bin | gbrain capture --stdin` also rejects.
+- **`gbrain capture --source dept-x`** uses the canonical 6-tier source resolution chain (flag → env → dotfile → local_path → brain_default → seed_default), matching every other CLI op. Pre-fix, capture silently ignored `GBRAIN_SOURCE` and `.gbrain-source` dotfiles.
+- **`gbrain capture --source nonexistent-source`** now prints `source 'nonexistent-source' is not registered. Register it first: gbrain sources add nonexistent-source --path <path>` instead of the raw `pages_source_id_fk` Postgres error.
+- **`gbrain call get_page <slug> | jq .source_kind`** actually returns the value the write side stored. Migration v81 added the 4 provenance columns; this release populates them on every put_page (with CV6 trust gating that prevents OAuth clients from spoofing arbitrary `source_kind` labels — server stamps `mcp:put_page` for remote callers regardless of what they send).
+- **POST `/ingest` with no body** returns `400 empty_body` JSON instead of a 500 HTML error page.
+- **Admin `/admin/api/register-client`** accepts `{"scope": "read write"}` (singular wire format), `{"scopes": ["read", "write"]}` (array), or `{"scopes": "read write"}` (string) — all three normalize correctly. Pre-fix only one shape worked.
+- **`brainstorm`/`lsd` on a PgBouncer-restricted environment** now print `Error [brainstorm_timeout]: Brainstorm query was canceled by Postgres` with a hint covering the three Postgres cancel sub-causes (statement_timeout, lock_timeout, user-cancel) and a paste-ready workaround. Pre-fix: silent no-output after the 10-second cost-preview wait.
+
+### What you'd see in a concrete example
+
+```
+$ printf -- '---\ntitle: My Pre-Existing Title\ntags: [work, deal]\n---\n\n# Notes from the meeting\n\nbody here\n' > /tmp/m.md
+$ gbrain capture --file /tmp/m.md --json | jq '.slug, .content_hash, .source_kind'
+"inbox/2026-05-22-a1b2c3d4"
+"f7e6d5..."
+"capture-cli"
+
+$ gbrain capture --file /tmp/m.md --json | jq '.slug, .content_hash'
+"inbox/2026-05-22-a1b2c3d4"  ← SAME slug
+"f7e6d5..."                   ← SAME hash (dedup works)
+
+$ gbrain call get_page --slug inbox/2026-05-22-a1b2c3d4 | jq '.title, .source_kind, .ingested_via'
+"My Pre-Existing Title"     ← user title preserved
+"capture-cli"               ← provenance populated in DB
+"capture-cli"
+
+$ gbrain capture --file /tmp/has-null-byte.bin
+gbrain capture: refusing to capture binary content from /tmp/has-null-byte.bin
+  Found null byte at offset 5 (first 8KB scan); text files (including UTF-8
+  CJK/emoji/BOM) never contain NUL bytes.
+
+$ gbrain capture "x" --source nonexistent
+gbrain capture: source 'nonexistent' is not registered. Register it first:
+  gbrain sources add nonexistent --path <path>
+
+List registered sources:
+  gbrain sources list
+
+$ curl -i -X POST localhost:3131/ingest -H "Authorization: Bearer $TOKEN"
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+{"error":"empty_body","message":"POST /ingest requires a non-empty body"}
+```
+
+### Things to watch
+
+- **`--source` is now rejected on thin-client installs** (gbrain serve --http with remote MCP clients like Claude Desktop, Cursor) with a clear error pointing at server-side `gbrain auth register-client --source <id>`. Server-side OAuth client registration owns source scope; per-call client override would reopen the spoofing surface this release just closed.
+- **Provenance UPDATE uses COALESCE-preserve.** A `put_page` that doesn't pass `source_kind` keeps the existing value (first-write-wins audit trail). A `put_page` that passes new provenance overwrites (explicit re-ingestion). The honest answer for "what was the most recent ingestion source for this page" lives in the DB; routine edits don't erase it.
+- **`source_kind` taxonomy is now closed:** `capture-cli | put_page | mcp:put_page | webhook | file-watcher | inbox-folder | cron-scheduler` per migration v81's documented set. `--source dept-x` maps to the DB source_id (which source row owns this page), NOT to source_kind. The two were conflated pre-fix.
+- **`--type meeting` and `--type idea` for the same content write to the SAME slug** (slug = content hash, so identical text deterministically produces the same slug). A later capture with a different `--type` overwrites the prior page. Documented in `gbrain capture --help` so it's not surprising.
+- **Brainstorm timeout surfacing is diagnostic-only this release.** The hint points at three potential causes (PgBouncer statement_timeout, lock_timeout, user-cancel) and suggests workarounds, but the underlying SQL-shape rewrite of `listPrefixSampledPages` for PgBouncer compatibility is filed as a v0.39 TODO. If you hit this on every brainstorm and the workarounds don't help, file an issue.
+- **A diagnostic stack trace will print ONCE** on first `gbrain capture` per process for the long-standing `[facts:absorb] failed to log gateway_error ... No database connection` warning — subsequent occurrences are silent. This gives the v0.38.4 fix the call site it needs without per-capture noise. If you hit this regularly, the trace is useful to file with an issue.
+
+## To take advantage of v0.39.3.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about anything:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **No host-agent action needed.** All fixes are in gbrain itself; your agent's skills don't change.
+3. **Verify the outcome:**
+   ```bash
+   # Verify provenance write-through works
+   SLUG=$(gbrain capture "v0.39.3.0 smoke" --json | jq -r .slug)
+   gbrain call get_page --slug "$SLUG" | jq '.source_kind, .ingested_via'
+   # Should print "capture-cli" twice (not null/null)
+
+   # Verify dedup
+   H1=$(gbrain capture "same text" --json | jq -r .content_hash)
+   H2=$(gbrain capture "same text" --json | jq -r .content_hash)
+   [ "$H1" = "$H2" ] && echo "dedup OK" || echo "DEDUP REGRESSION"
+
+   # Verify CLI help
+   gbrain --help | grep -qE '^\s*capture\s' && echo "capture listed OK"
+   gbrain capture --help | grep -c -- '--' # should be >= 7 lines with --flag docs
+
+   gbrain doctor
+   ```
+4. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - which step broke
+   - the v0.38.0.0 smoke-test report at `docs/v0.38-smoke-test-report.md` for context on what was tested
+
+### Itemized changes
+
+- **`src/commands/capture.ts`** — biggest single-file delta in the wave:
+  - **BUG-1 frontmatter merge.** New `mergeCaptureFrontmatter(rawBody, opts)` pure helper uses gray-matter's `matter()` + `matter.stringify()` directly (NOT the lossy `parseMarkdown` from src/core/markdown.ts which strips type/title/tags/slug). User-wins precedence: spread user's declared keys first, then capture's auto-fields (type → CLI flag > userFm > 'note', title → userFm > derived, captured_via → userFm > opts.source > 'capture-cli', captured_at → userFm > now). Single output frontmatter block in all cases.
+  - **CV3 source_kind taxonomy.** Always stamps `source_kind='capture-cli'` regardless of `--source` (which now maps to source_id only).
+  - **CV15 canonical source resolver.** Routes through `resolveSourceWithTier(engine, parsed.source, cwd)` from `src/core/source-resolver.ts` — honors flag → env (`GBRAIN_SOURCE`) → dotfile (`.gbrain-source` walk-up) → local_path → brain_default → seed_default. Matches every other CLI op.
+  - **CV7 thin-client `--source` rejection.** Exits 1 BEFORE network call with clear error pointing at server-side `gbrain auth register-client --source <id>`.
+  - **CV8 + CV9 hash normalization.** New `normalizeForHash(s)` helper (trim + BOM strip + LF + NFKC). Receipt content_hash from normalized rawBody, NOT the assembled fullContent with timestamp.
+  - **CV10 binary file guard.** New `detectBinaryNullByte(buf)` scans first 8KB for NUL byte. Applied to BOTH `--file` (read as Buffer, no encoding) AND `--stdin` (new `readStdinBuffer()`). Rejects with friendly error including byte offset.
+  - **A2 FK error rewrite.** New `maybeRewriteSourceFkError(err, sourceId)` helper applied in BOTH local-engine and thin-client (`callRemoteTool`) catch blocks per T1. Detects Postgres `pages_source_id_fk` violations and rewrites to paste-ready hint.
+- **`src/commands/serve-http.ts`** — `/ingest` BUG-2 fix (null-guard at the top of body coercion + outer try/catch with `!res.headersSent` guard per codex F#16); `/admin/api/register-client` WARN-9 fix (accepts both `scope` and `scopes` request keys; normalizes via `normalizeScopesInput`).
+- **`src/cli.ts`** — `capture` added to `CLI_ONLY_SELF_HELP` set + pre-engine-bind `--help` short-circuit in `handleCliOnly` (mirrors the existing sync + reinit-pglite pattern). New `BRAIN` section in `printHelp` text covering capture / brainstorm / lsd with their key flags.
+- **`src/core/operations.ts`** — `put_page` op accepts 3 new optional params (source_kind, source_uri, ingested_via). CV6 trust gate: when `ctx.remote !== false`, IGNORES client params and server-stamps `mcp:put_page` regardless. Threads provenance through `importFromContent` to engine `putPage`.
+- **`src/core/import-file.ts`** — CV8 part 2: `importFromContent` excludes `captured_at` and `ingested_at` from the DB content_hash (whitelist of "ephemeral" frontmatter keys). Body + non-ephemeral frontmatter changes still trigger re-chunk; capture-cli's per-call timestamp doesn't invalidate the cache.
+- **`src/core/postgres-engine.ts` + `src/core/pglite-engine.ts`** — `putPage` SQL writes the 4 provenance columns with `COALESCE-preserve UPDATE` semantics (CV12: omitting params on a later put_page preserves prior values; first-write-wins audit trail). `getPage` SQL projection includes the 4 columns so the read path surfaces them.
+- **`src/core/utils.ts`** — `rowToPage` maps the 4 new columns to `Page` fields via the three-state conditional spread pattern (matches v0.26.5 deleted_at convention).
+- **`src/core/types.ts`** — `PageInput` AND `Page` gain 4 optional provenance fields with docstring trust-model + read-path notes.
+- **`src/core/scope.ts`** — new exported `normalizeScopesInput(raw: unknown): string` helper validates string / array / missing / empty shapes against the existing `ALLOWED_SCOPES` allowlist. Rejects `['read write']` (space-in-element bug shape codex flagged), empty arrays, non-string elements, unknown scope names.
+- **`src/core/facts/absorb-log.ts`** — WARN-4 + CQ1 + CV13: typed access via `instanceof GBrainError && e.problem === 'No database connection'` (NOT string-match on message). First-occurrence-per-process stack trace info log; subsequent occurrences silent. Other failure classes still warn loudly.
+- **`src/core/brainstorm/orchestrator.ts` + new `src/core/brainstorm/error-classify.ts`** — CV11 + T4: orchestrator-level try/catch at the public `runBrainstorm` entry covers EVERY internal SQL site. Classifies SQLSTATE 57014 (via postgres.js `.code`, alternate `.sqlState`, or message fallback) into `StructuredAgentError` with code='brainstorm_timeout' and hint covering all 3 PG cancel sub-causes. Non-57014 errors rethrow as-is.
+- **`src/commands/brainstorm.ts`** — catches `StructuredAgentError` before main()'s catch-all and prints `Error [<code>]: <message>` + `Hint: <hint>` lines (mirrors `cli.ts:188-191` OperationError block). JSON mode emits the structured envelope.
+
+### Tests
+
+- **`test/capture-build-content.test.ts`** (NEW, 19 cases, 47 assertions) — CQ2 boil-the-lake: 13 specified cases plus CJK title, CRLF line endings, UTF-8 BOM, empty frontmatter, malformed YAML, no-trailing-newline-before-body, user description/tags/slug passthrough, + 3 deriveTitle cases + 2 --type CLI precedence cases + BUG-1 regression guard with the exact reported input shape.
+- **`test/capture-runcapture.test.ts`** (NEW, 26 cases, 30 assertions) — CV10 binary guard (10 cases), CV9 normalization (6 cases), CV8 hash stability (4 cases), A2 FK error rewrite (6 cases).
+- **`test/put-page-provenance.test.ts`** (NEW, 11 cases, 29 assertions) — trusted local caller honored, CV6 spoofing guard (remote + undefined-trust), CV12 COALESCE-preserve UPDATE, T2 subagent namespace regression with provenance params.
+- **`test/scope-normalize.test.ts`** (NEW, 28 cases) — happy paths (12) + rejection cases (14) + determinism (2).
+- **`test/cli-help-discoverability.test.ts`** (NEW, 6 cases) — capture --help reaches detailed HELP, main --help lists all 3 BRAIN commands, regression guard for existing top-level groups.
+- **`test/brainstorm-timeout.test.ts`** (NEW, 14 cases) — `isQueryCanceledError` across driver shapes, `classifyBrainstormError` typed envelope + hint coverage + non-57014 passthrough, source-shape regression guards.
+- **`test/facts-absorb-log.test.ts`** (extended, 4 new cases) — WARN-4 first-occurrence + suppression contract; other failure classes still warn.
+- **`test/import-file.test.ts`** (extended, 4 new cases) — CV8 DB content_hash stability: timestamp differences IDENTICAL hash, body change DIFFERENT hash, tag change DIFFERENT hash (regression guard), ingested_at differences IDENTICAL.
+- **`test/e2e/engine-parity.test.ts`** (extended, 2 new cases) — provenance columns parity + COALESCE-preserve parity across Postgres + PGLite (T3).
+- **`test/e2e/serve-http-ingest-webhook.test.ts`** (extended, 1 new case) — BUG-2: POST with no body returns 400 JSON envelope (not 500 HTML).
+
+### For contributors
+
+- The smoke-test report at `docs/v0.38-smoke-test-report.md` was contributed by `@garrytan-agents` via PR #1299. PR closed as superseded; report ships verbatim with an Editor's Note prepended pointing at this CHANGELOG for the two factual corrections (BUG-2 line location was re-diagnosed; WARN-5 root cause was identified as a missing entry in `CLI_ONLY_SELF_HELP`).
+- The plan-eng-review flow on the v0 plan produced 15 decisions, 9 of them via codex outside-voice. Plan + decision trace at `~/.claude/plans/system-instruction-you-are-working-async-popcorn.md`.
+- Filed v0.39+ TODOs: SQL-shape rewrite of `listPrefixSampledPages` for PgBouncer; magic-byte allowlist for binary content detection; `--source-kind` override flag; facts:absorb root-cause trace; ingest_capture Minion handler architecture migration.
+
+
+## [0.39.2.0] - 2026-05-22
+
+**Your federated brain refreshes all its sources in parallel now, not one at a time.**
+
+If you have a brain with multiple sources — say `personal`, `portfolio`, and
+`yc` — autopilot used to refresh one of them per tick. Five-minute ticks, five
+sources, worst case ~25 minutes for the last source to catch up. After this
+wave, autopilot fans out one cycle job per stale source per tick, and your
+workers process them in parallel. Same five-source brain refreshes in roughly
+one tick of wall-clock.
+
+The lock infrastructure underneath also got cleaner. Pre-v0.39 the cycle held
+ONE global row in `gbrain_cycle_locks` keyed `'gbrain-cycle'` — so two
+`gbrain dream --source X` and `--source Y` runs in different terminals
+blocked each other. After: each source gets its own lock row
+(`gbrain-cycle:<source_id>`), so they run concurrently on Postgres.
+PGLite still serializes through a single file lock because the underlying
+storage is single-writer; that's preserved as belt-and-braces.
+
+### How it works
+
+| Surface | What it does |
+|---|---|
+| `engine.listAllSources()` | New lean per-source enumeration. `localPathOnly:true` filters pure-DB sources so fan-out doesn't dispatch jobs that would fall back to the global `sync.repo_path`. |
+| `cycleLockIdFor(sourceId)` | Per-source lock primitive. `undefined` returns legacy `'gbrain-cycle'` (back-compat for autopilot's no-source path); set returns `'gbrain-cycle:<id>'`. Defense-in-depth validation via `assertValidSourceId`. |
+| `CycleOpts.sourceId` | First-class field on the cycle entry point. `runCycle({sourceId})` writes `last_full_cycle_at` to `sources.config` JSONB on success. |
+| `dispatchPerSource` | Per-tick fan-out helper. Enumerates sources, computes per-source freshness from `last_full_cycle_at`, submits up to `fanoutMax` jobs (default 4 Postgres, 1 PGLite). Per-source idempotency keys (`autopilot-cycle:<id>:<slot>`) dedup within a slot; different sources never collide. |
+| `autopilot-cycle` handler | Threads `source_id` + `pull` from job data. Archive recheck happens at handler entry (before lock acquisition) so a source archived between fan-out and worker claim returns `{status: 'skipped'}` cleanly. |
+| `cycle_freshness` doctor check | Sibling to `sync_freshness`. Reads what autopilot sees: per-source `last_full_cycle_at` with 6h warn / 24h fail. `gbrain dream --source <id>` is the fix hint. |
+| `cycle_phase_scope` doctor check | Informational. Renders the static taxonomy: which phases are `source`-scoped vs `global` vs `mixed`. Documents what future fan-out waves can safely parallelize. |
+| Tunable `autopilot.fanout_max_per_tick` | Operator override for the per-tick cap. PGLite enforces 1 regardless (single-writer). |
+
+### What you'll see
+
+```
+$ gbrain autopilot --json
+[dispatch] fanout: 3 dispatched, 1 fresh, 0 capped (score=92, max=4)
+{"event":"dispatched","job_id":42,"mode":"per_source","source_id":"personal","pull":false,"slot":"2026-05-22T15:00:00.000Z"}
+{"event":"dispatched","job_id":43,"mode":"per_source","source_id":"portfolio","pull":true,"slot":"2026-05-22T15:00:00.000Z"}
+{"event":"dispatched","job_id":44,"mode":"per_source","source_id":"yc","pull":true,"slot":"2026-05-22T15:00:00.000Z"}
+{"event":"fanout_summary","dispatched":["personal","portfolio","yc"],"skipped_fresh":["scratch"],"fanout_max":4}
+```
+
+Single-source brains see zero change. The fan-out path falls back to the
+legacy single-job dispatch when `sources` has no rows with `local_path`
+set, so fresh `gbrain init` installs keep working exactly as before.
+
+### Things to know
+
+- **`validateSourceId` tightened.** The path-safety regex went from
+  permissive `^[a-z0-9_-]+$` to strict kebab `^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$`
+  (matches what `sources-ops` always enforced at creation time). Underscored
+  source IDs were never accepted at creation, so no existing IDs break, but
+  the new regex is now the canonical contract everywhere. If you somehow
+  have underscored IDs in production, run `gbrain sources list` and rename
+  before upgrading.
+- **CycleOpts.sourceId is new.** Existing callers (autopilot's legacy
+  path, `gbrain dream` without `--source`) skip the per-source `last_full_cycle_at`
+  write so back-compat is byte-perfect. New CLI invocations and the fan-out
+  path opt in.
+- **Phase-scope honesty.** Per-source LOCKS let two cycles RUN concurrently,
+  but several phases inside each cycle (`embed`, `orphans`, `purge`,
+  `resolve_symbol_edges`, `grade_takes`, `calibration_profile`) still walk
+  the brain globally. The new `cycle_phase_scope` doctor check documents
+  this exhaustively. Genuine per-phase isolation is a follow-up wave; this
+  one ships the foundation cleanly.
+
+### Itemized changes
+
+#### Per-source parallelism
+
+- `src/core/source-id.ts` (NEW, dependency-free): canonical `SOURCE_ID_RE`
+  + `isValidSourceId(s)` boolean + `assertValidSourceId(s)` throw. Single
+  source of truth for the three regex sites that drifted pre-v0.39.
+- `src/core/utils.ts:validateSourceId` re-exports `assertValidSourceId`
+  for back-compat (regex tightens).
+- `src/core/sources-ops.ts` + `src/core/source-resolver.ts` migrate to
+  `source-id.ts`. Resolver tiers 3 + 5 (dotfile, brain_default) use
+  `isValidSourceId` for silent fallback; tiers 1 + 2 (explicit, env) throw.
+- `src/core/cycle.ts`: `acquirePostgresLock` + `acquirePGLiteLock` deleted
+  (~75 LOC of duplicated UPSERT SQL); replaced with `tryAcquireDbLock`
+  from `db-lock.ts`. `cycleLockIdFor(sourceId?)` primitive. `CycleOpts.sourceId`
+  first-class. PGLite file lock acquired BEFORE per-source DB lock with
+  release-both-on-failure cleanup.
+- `src/core/cycle.ts`: `PHASE_SCOPE` taxonomy alongside `ALL_PHASES`.
+  Sixteen phases classified `source` / `global` / `mixed`.
+- `src/core/cycle.ts`: exit hook writes `last_full_cycle_at` to
+  `sources.config` JSONB when `opts.sourceId` is set and status is
+  `ok`/`clean`/`partial`. Best-effort; failure logs warning, doesn't
+  affect cycle status.
+
+#### Engine API
+
+- `src/core/engine.ts`: new `SourceRow` type + `listAllSources(opts?)` +
+  `updateSourceConfig(sourceId, patch)`. Both implemented on Postgres
+  + PGLite. Atomic JSONB merge via `config || $patch::jsonb` (Postgres `||`
+  concat operator); idempotent on re-run.
+
+#### Autopilot
+
+- `src/commands/autopilot-fanout.ts` (NEW): `resolveFanoutMax` (PGLite=1,
+  Postgres=4), `readLastFullCycleAt`, `isSourceStale`,
+  `selectSourcesForDispatch` (stale-only, oldest-first, alphabetical
+  tiebreaker), `dispatchPerSource` (the orchestrator).
+- `src/commands/autopilot.ts:401-503`: existing `shouldFullCycle` branch
+  now calls `dispatchPerSource` instead of submitting one job per tick.
+  Per-source idempotency keys, per-source `pull` flag based on
+  `source.config.remote_url`, NO `maxWaiting` (would silently coalesce
+  per-name+queue — the E2E-found bug).
+- `src/commands/jobs.ts:1146` autopilot-cycle handler: validates
+  `job.data.source_id` via `isValidSourceId` at entry; archive recheck
+  via `SELECT archived FROM sources WHERE id = $1` before runCycle; honors
+  `job.data.pull` (overrides legacy hardcoded `true`); back-compat preserved
+  when `source_id` is omitted.
+
+#### Doctor
+
+- `src/commands/doctor.ts`: new `checkCycleFreshness` (per-source
+  `last_full_cycle_at` with 6h/24h thresholds). Reads what autopilot
+  actually sees.
+- `src/commands/doctor.ts`: new `checkCyclePhaseScope` (informational;
+  renders the taxonomy as both human message and `details.phase_scope_map`
+  for JSON consumers).
+- `Check.details?` field added (mirrors `PhaseResult.details`).
+
+#### Tests (149 new cases across 13 new test files)
+
+- `test/source-id.test.ts` (19 cases) — exhaustive regex coverage
+- `test/regression-strict-source-id.test.ts` (9 cases) — blast-radius
+  pin (patterns.ts + synthesize.ts reverse-write callers)
+- `test/source-resolver-silent-fallback.test.ts` (12 cases) — codex P1-F
+  per-tier validation contract
+- `test/cycle-lock-per-source.test.ts` (13 cases) — `cycleLockIdFor`
+  primitive + per-source isolation
+- `test/cycle-pglite-lock-ordering.test.ts` (6 cases) — PGLite file+DB
+  ordering + release-both-on-failure (codex P0-C/P0-D regression)
+- `test/cycle-last-full-cycle-at.test.ts` (5 cases) — exit hook write
+  semantics + dry-run/legacy/skipped gates
+- `test/phase-scope-coverage.test.ts` (6 cases) — PHASE_SCOPE↔ALL_PHASES
+  coverage + scope value validation
+- `test/list-all-sources.test.ts` (11 cases) — PGLite parity for
+  listAllSources + updateSourceConfig
+- `test/autopilot-fanout.test.ts` (28 cases) — fan-out helper:
+  freshness gate, cap, idempotency, oldest-first, per-source error
+  isolation, regression guard against re-adding `maxWaiting`
+- `test/autopilot-cycle-handler.test.ts` (7 cases) — handler
+  source_id/archive/pull semantics
+- `test/autopilot-fanout-wiring.test.ts` (5 cases) — static-shape
+  regression for autopilot.ts ↔ dispatchPerSource wiring
+- `test/doctor-cycle-freshness.test.ts` (9 cases) — freshness check
+  thresholds + edge cases
+- `test/doctor-cycle-phase-scope.test.ts` (5 cases) — phase taxonomy
+  doctor check
+- `test/e2e/list-all-sources-postgres.test.ts` (11 cases) — Postgres
+  parity for engine methods + JSONB shape regression
+- `test/e2e/autopilot-fanout-postgres.test.ts` (6 cases) — end-to-end:
+  3-source fan-out producing 3 distinct minion_jobs rows with per-source
+  idempotency keys, cap behavior, freshness gate, legacy fallback
+- `test/e2e/multi-source-bug-class.test.ts` updated: 3 new cases pinning
+  the strict-regex contract shift (codex P1-D follow-through)
+
+#### Bug fix found by E2E
+
+The Postgres E2E surfaced that `maxWaiting: 1` on per-source `queue.add`
+calls was silently coalescing all N per-source jobs (sharing
+`name='autopilot-cycle'`) into ONE waiting row. Net effect: fan-out
+would only process the first source per tick, regardless of how many
+were stale. Fixed in c7ed9b99; regression-guard unit test pins that
+`maxWaiting` never reappears in the per-source submit opts.
+
+### Upgrade
+
+`gbrain upgrade` handles this — no manual migration. Run
+`gbrain doctor` after to see `cycle_phase_scope` + `cycle_freshness`
+in your check output. Federated-brain operators will see new
+`fanout_summary` events in the autopilot stream and can tune
+`autopilot.fanout_max_per_tick` if desired.
+
+## To take advantage of v0.39.2.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if
+`gbrain doctor` warns about anything:
+
+1. **Verify the new doctor checks render:**
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name | test("cycle_freshness|cycle_phase_scope"))'
+   ```
+   Both checks should appear with status `ok`. `cycle_phase_scope` is
+   informational and always `ok`. `cycle_freshness` is `ok` on
+   single-source brains (no federated sources to gate); on federated
+   brains it'll reflect the actual per-source freshness state.
+
+2. **If you have a federated brain, watch the autopilot stream:**
+   ```bash
+   gbrain autopilot --json 2>&1 | grep -E "fanout|dispatched"
+   ```
+   You should see `mode: per_source` events with distinct `source_id`
+   values, plus a `fanout_summary` per tick.
+
+3. **Optional: tune the cap:**
+   ```bash
+   # Default is 4 on Postgres, 1 on PGLite. Bump if you have 8+ sources
+   # AND >= 4 workers AND GBRAIN_POOL_SIZE >= 10.
+   gbrain config set autopilot.fanout_max_per_tick 8
+   ```
+
+4. **If any step fails or the numbers look wrong,** please file an
+   issue at https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor --json`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+
+   This feedback loop is how the gbrain maintainers find fragile
+   upgrade paths.
+
+## [0.39.0.0] - 2026-05-21
+
+**You can finally cap the cost of `gbrain brainstorm` and `gbrain lsd`, AND if the cap fires mid-run, you can resume right where you left off without losing the ideas you already paid for.**
+
+The 13K-page brain incident that started this wave is real and was expensive. A `gbrain lsd` run estimated $0.96, actually billed $50.71, generated zero usable ideas. The fix wave already merged (PR #1234) capped the prefix sampling that caused the explosion. This release goes one cathedral further: every LLM call that any `gbrain` command makes is now accounted at the gateway layer, so the same cap that protects brainstorm also protects `doctor --remediate`, `eval suspected-contradictions`, the dream cycle, and any future LLM-calling command. The plumbing is shared.
+
+What that means in the hand: pass `--max-cost N` to brainstorm or lsd or `doctor --remediate`, and the first overflow throws a typed error before any extra dollars are spent. The throw fires from inside the gateway's reserve check, so a budget exhaustion never even acquires a rate-lease slot or makes a provider HTTP call. The cap is a real ceiling, not a suggestion.
+
+When brainstorm IS exhausted mid-run, the orchestrator persists what's been done to `~/.gbrain/brainstorm/<run_id>.json` with the FULL idea bodies (not just counts), then re-throws. The user paste-runs the suggested `gbrain brainstorm --resume <run_id>` and the second run skips the already-completed crosses, runs only the missing ones, then merges everything before the judge runs. The final BrainstormResult contains the pre-crash ideas AND the post-resume ideas. (Codex's outside-voice review was the one that caught this — a resume that produces only the second-run's ideas would be silent partial output, which is worse than no resume at all.)
+
+### How to turn it on
+
+```bash
+# Cap brainstorm cost at $2 (default $5). Throws BudgetExhausted if exceeded.
+gbrain brainstorm "what story should I write next" --max-cost 2
+
+# Crash recovery — list saved runs, resume the one you want.
+gbrain brainstorm --list-runs
+gbrain brainstorm --resume 1a2b3c4d5e6f7890
+
+# Bypass the 7-day staleness gate if you really mean it.
+gbrain brainstorm --resume 1a2b3c4d5e6f7890 --force-resume
+
+# Same cap, different command — doctor's autonomous remediation now resumes too.
+gbrain doctor --remediate --max-cost 5
+# (on BudgetExhausted, the run persists a checkpoint at
+#  ~/.gbrain/remediation/<plan_hash>.json and tells you the --resume command)
+gbrain doctor --remediate --resume
+```
+
+### What's safe to know about
+
+A4 amended is a semantic shift: `gbrain doctor --remediate --max-usd` used to be a pre-flight estimate check ("refuse if est > cap"); it's now ALSO a mid-run hard ceiling backed by BudgetTracker via the gateway's AsyncLocalStorage scope. If you cron-schedule `--remediate`, the worst case used to be "the run starts despite the under-estimate"; now the worst case is "the run aborts mid-step and writes a resumable checkpoint." The first failure-mode is gone; the second is recoverable via `--resume`. `--max-cost` is a new alias for `--max-usd` for symmetry with brainstorm.
+
+The brainstorm checkpoint identity intentionally uses NO embedding bits: `run_id = sha256(question + profile + sort(close_slugs) + sort(far_slugs)).slice(0,16)`. Swap your embedding model between runs and the resume still finds the checkpoint. Conversely, change the question by even one word and you get a different run_id (the previous checkpoint is left alone; the cycle purge phase GCs anything older than 7 days).
+
+The dream cycle's `~/.gbrain/audit/dream-budget-YYYY-Www.jsonl` grew one new field on every line: `schema_version: 1`. Reorderings are tolerated (downstream consumers should index by field name, not position); renames or removals are breaking. The same schema-stable contract holds for the new `~/.gbrain/audit/budget-YYYY-Www.jsonl` produced by the unified `BudgetTracker`.
+
+If you wrote integration code against `BudgetExhausted` in the brainstorm orchestrator before this release: that class moved to `src/core/budget/budget-tracker.ts`. The orchestrator re-exports the old name for back-compat, so existing imports keep working.
+
+### Itemized changes
+
+- **`BudgetTracker` is the new canonical primitive** at `src/core/budget/budget-tracker.ts`. One class, one typed error (`BudgetExhausted` with `reason: 'cost' | 'runtime' | 'no_pricing'`), one schema-stable audit JSONL. Pinned by 18 unit cases covering TX1 (record throws when cumulative exceeds cap), TX2 (no_pricing hard-fails when cap is set + pricing missing), A3 amended (pessimistic fallback when `err.usage` is absent), the onExhausted-fires-once-before-throw contract, and the schema-stable audit schema.
+- **`withBudgetTracker(tracker, fn)` at the gateway layer (TX5)** installs the tracker on a module-internal `AsyncLocalStorage<BudgetTracker>`. Every `gateway.chat / embed / rerank` call inside the scope auto-composes. Outside-scope calls are budget no-ops (existing behavior preserved). Nested scopes restore the outer on exit. Parallel `Promise.all` scopes do not bleed trackers across each other.
+- **Subagent rate-lease ordering pinned (A1)**: the gateway's `reserve()` runs BEFORE `acquireLease()` in `src/core/minions/handlers/subagent.ts`. A budget throw must NOT consume a rate-lease slot. The handler body itself no longer needs explicit budget threading; the AsyncLocalStorage composition handles it.
+- **`payload-fitter.ts` (P6)** lands at `src/core/diarize/payload-fitter.ts` with two strategies. `'batch'` is deterministic token-budgeted chunking, no LLM calls. `'summarize'` embed-clusters then Haiku-summarizes each cluster in parallel via `Promise.allSettled` at parallelism=4. The quality gate flags `degraded: true` when success ratio drops below the configured `min_success_ratio` (default 0.75) — caller decides whether to surface or abort.
+- **Brainstorm checkpoint (P7)** at `src/core/brainstorm/checkpoint.ts`. Atomic .tmp+rename writes. Full idea bodies persisted (TX3). One-flag resume (TX4). 7-day mtime-based GC wired into the cycle purge phase.
+- **`doctor --remediate --resume`** loads `~/.gbrain/remediation/<plan_hash>.json` and continues from the next un-completed step. Refuses on mismatched plan_hash with a paste-ready message.
+- **`gbrain brainstorm --list-runs`** prints saved run_ids + iso dates + question stems so the user can pick which to resume.
+- **ISO-week audit filenames consolidated** into `src/core/audit-week-file.ts`. Four call sites migrated (shell-jobs, phantoms, slug-fallback, dream-budget). Year-boundary cases (2020-W53, 2024-12-30 belongs to 2025-W01) pinned by tests.
+- **eval-contradictions** routes through `withBudgetTracker` for telemetry without changing the CLI surface. `--budget-usd` semantics + `PreFlightBudgetError` shape are byte-identical.
+
+### For contributors
+
+- `bun test` adds 73 new tests across 9 new files (`test/core/budget/`, `test/core/audit-week-file.test.ts`, `test/core/diarize/`, `test/brainstorm/checkpoint.test.ts`, `test/e2e/brainstorm-resume.test.ts`, `test/core/remediation-checkpoint.test.ts`). Plus F1 closes the pre-existing PGLite `page_links` schema gap (the brainstorm domain-bank queries `page_links` but the embedded schema only defined `links`). Brainstorm now works against PGLite brains in production via the new `page_links` view alias shipped in both the embedded schema bundle and migration v86 (renumbered from v81 during merge with master's v0.38 cathedrals which claimed v81-v85). F2 adds an E2E pinning the user-facing `--max-cost` pre-flight refusal path. F3 adds `--max-cost` to `gbrain reindex --code`. All previous brainstorm + doctor + eval-contradictions tests still pass.
+
+## To take advantage of v0.39.0.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+   This applies migration v86 (`page_links_view_alias`) on PGLite + Postgres brains. The alias is required for `gbrain brainstorm` and `gbrain lsd` to work against the domain-bank tiebreaker; without it, the brainstorm domain-bank queries fail with `relation "page_links" does not exist`.
+2. **Set a cost cap on the commands you care about:**
+   ```bash
+   # Sets a per-run dollar ceiling. Throws BudgetExhausted before any LLM call
+   # if the pre-run estimate exceeds the cap, AND mid-run if cumulative spend
+   # blows past it.
+   gbrain brainstorm "test" --max-cost 1
+   gbrain doctor --remediate --max-cost 5
+   gbrain reindex --code --max-cost 10
+   ```
+3. **Verify the outcome:**
+   ```bash
+   gbrain doctor             # schema_version should be 86
+   gbrain brainstorm --list-runs   # confirms the new checkpoint directory exists
+   ```
+4. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+   This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
+## [0.38.2.0] - 2026-05-22
+
+**`gbrain doctor` no longer hangs on big brains, and gives you real signal when it has to give up.**
+
+If you've got a sizeable brain (tens of thousands of pages and up, especially in a repo that doubles as a code workspace), `gbrain doctor` used to feel like it locked up. The frontmatter check would sit there for a minute or more, and any cron monitor wrapping it would time out and report the whole health report as failed. The actual problem turned out to be embarrassing: the scanner was crawling into `node_modules/`, `.git/`, `.obsidian/`, and other vendor directories on every doctor run, paying the cost of touching hundreds of thousands of files it was always going to throw away. This release stops doing that, AND adds a real wall-clock budget so even pathologically large sources get a useful answer instead of a hang.
+
+When the budget does run out, doctor now tells you exactly which sources finished, which one got partway, and which ones never got checked, with a paste-ready remediation command per source. No more black-box "scan timed out."
+
+### How to upgrade
+
+```bash
+gbrain upgrade
+# That's it. No manual steps. Doctor is faster on the next run.
+```
+
+### What you'd see in a concrete example
+
+A brain with 3 federated sources where source-b is huge:
+
+```
+$ gbrain doctor
+...
+frontmatter_integrity: warn
+  216 frontmatter issue(s) (PARTIAL SCAN — timeout after 30s).
+  src-a: 14 (NESTED_QUOTES=14);
+  src-b: PARTIAL — scanned ~42000 files (source has ~200000 pages in DB), 202 issue(s) so far, NESTED_QUOTES=202;
+  src-c: NOT SCANNED (timeout — run `gbrain frontmatter validate src-c`).
+  Raise GBRAIN_DOCTOR_FM_TIMEOUT_MS or run `gbrain frontmatter validate <source>` directly.
+```
+
+You get the breakdown per source instead of a single opaque warn. If you want a bigger budget for that one cron, `export GBRAIN_DOCTOR_FM_TIMEOUT_MS=60000` (default is 30 seconds).
+
+### The numbers that matter
+
+| Brain shape | Pre-v0.38.2.0 | Post-v0.38.2.0 |
+|---|---|---|
+| 10K real pages, no vendor dirs | seconds | seconds (no regression) |
+| 10K real pages + node_modules with 50K files | hangs past 30s | seconds (descent prunes vendor trees) |
+| 200K+ real pages, single source | hangs forever | partial result inside budget, per-source breakdown |
+| Cron wrapped in `timeout 60s` | exit 124, full health report fails | exit 0, `frontmatter_integrity: warn` with actionable detail |
+
+### Things to watch
+
+- **`gbrain frontmatter validate <source>` is also faster.** The same fix applies to that command's walker (there were two walkers with the same bug; one PR closed both).
+- **`AbortSignal.timeout` is the lesser bound, not the load-bearing one.** The hard wall-clock guarantee comes from a deadline check inside the file-by-file scan loop. (Pre-merge a Codex review caught that the timer-based abort can't interrupt synchronous filesystem calls; the deadline check is what actually fires mid-walk.)
+- **Steady-state cost is still O(N) in real pages.** This release delivers bounded wall-clock and honest partial-state signal, NOT sub-second steady-state doctor. Driving the steady state to constant-cost needs DB-backed scan state — designed in `docs/architecture/frontmatter-scan-incremental.md`, deferred to a follow-up PR because schema migrations carry their own contract surface.
+
+### Supersedes PR #1287
+
+Community PR #1287 (by @garrytan-agents) diagnosed the hang correctly and proposed a 10-line `AbortSignal.timeout` band-aid. We took the bug seriously enough to find a deeper root cause: the walker was descending into vendor directories on every tick. PR #1287 closes after this release lands. Thanks to the agent for the diagnosis — the timeout plumbing it added is part of the safety net that ships here.
+
+### Itemized changes
+
+- `src/core/brain-writer.ts`: `walkDir` now consults `pruneDir(name, parentDir)` at descent time, the canonical pruner used by sync/extract/transcript-discovery since v0.35.5.0. Skips `node_modules`, `.git`, `.obsidian`, `*.raw`, `ops`, all dot-prefix dirs, and git submodule dirs (`.git` as FILE per v0.37.7.0 #1169). `ScanOpts` gains `deadline?: number` (epoch ms) checked per file inside `scanOneSource` — the load-bearing wall-clock bound. `PerSourceReport` gains `status: 'scanned' | 'partial' | 'skipped'`, `files_scanned: number` (numerator), and `db_page_count?: number | null` (denominator from the doctor-supplied SQL hook). `AuditReport` gains `partial: boolean` and `aborted_at_source: string | null`. `ok` is now `grandTotal === 0 && !partial` — a clean prefix from a timed-out scan no longer falsely reports clean. `walkDir` exported with an optional `visitDir` test callback for the regression suite (production callers don't pass it).
+- `src/commands/frontmatter.ts`: `collectFiles` (the second walker — drives `gbrain frontmatter validate`) gets the same `pruneDir` wiring + optional `visitDir` callback. Now `export`ed. Without this fix, doctor's own remediation hint pointed users at a command that hung the same way.
+- `src/commands/doctor.ts`: `frontmatter_integrity` adopts the deadline + AbortSignal.timeout pair (configurable via `GBRAIN_DOCTOR_FM_TIMEOUT_MS`, default 30000ms). Per-source DB denominator via `SELECT COUNT(*) FROM pages WHERE source_id = $1 AND deleted_at IS NULL`. Partial render distinguishes `'scanned' | 'partial' | 'skipped'` with honest "scanned ~N files (source has ~M pages in DB)" wording — the DB COUNT and the on-disk scan are overlapping but not identical sets, and the message reflects that. Catch block simplified to "unexpected error only" (no AbortError special case; the abort path returns cleanly via partial state, not via throw).
+- Tests: `test/brain-writer-walk-prune.test.ts` (12 cases, REGRESSION suite for both walkers — uses the new `visitDir` callback for direct descent-time observability, not leaf-output assertions which would pass under the original bug). `test/brain-writer-partial-scan.test.ts` (5 cases for deadline + partial state + ok-after-abort + numerator/denominator). `test/doctor-frontmatter-partial.test.ts` (11 structural source-grep cases pinning the load-bearing render strings).
+- `tests/heavy/frontmatter_scan_wallclock.sh` (new, manual / nightly per `tests/heavy/README.md`): seeds a synthetic 60K-file brain (10K real + 50K under node_modules) and asserts `gbrain doctor` completes in <15s with `frontmatter_integrity: ok`. Catches the regression at a scale where the original bug actually shows.
+- `docs/architecture/frontmatter-scan-incremental.md`: Phase 2 design sketch for DB-backed scan state — schema migration, sync-side writes, autopilot cycle phase, doctor reader. Captured so the follow-up PR has a starting point.
+
+### For contributors
+
+- The walker test surface changes shape: `walkDir` (brain-writer.ts) and `collectFiles` (frontmatter.ts) are now exported with an optional `visitDir` callback. Tests should use this for descent-time pruning assertions; leaf-output tests can pass under the original bug since `isSyncable` filters at the leaf.
+- `scanBrainSources` now returns `partial` + `aborted_at_source` on `AuditReport` and `status` + `files_scanned` (+ optional `db_page_count`) per `PerSourceReport`. Any test that constructs `AuditReport` literals needs to include the new required fields. (One pre-existing test was updated as part of this PR.)
+- `runDoctor` still calls `process.exit` at the end — behavioral tests against it can't run via the unit-test runner. That refactor stays a TODO; the unit-test layer covers `scanBrainSources` + doctor's render shape via source-grep, and the heavy script covers end-to-end against a subprocess.
+
+
+## [0.38.1.0] - 2026-05-21
+
+**Your `gbrain agent run` loop can now run on any provider with native tool calling — not just Anthropic.** OpenAI, Google Gemini, OpenRouter, openai-compatible servers (Ollama, LiteLLM, vLLM, llama-server) all work. Pick the cheapest model that does the job for your agent, or stay on Anthropic if you want the prompt-cache cost savings on long loops.
+
+The pre-v0.38 subagent loop was Anthropic-direct: `new Anthropic()` instantiated inside the worker, the loop hard-pinned three layers deep because crash-replay reconciliation needed Anthropic's stable `tool_use_id`s. That pin is gone. The replay key is now gbrain-owned (uuid v7 + per-turn ordinal, persisted at first observation of each tool call) — the provider can return whatever id shape it wants and crash-replay still reconciles.
+
+How to turn it on:
+
+```bash
+gbrain config set agent.use_gateway_loop true
+gbrain config set models.tier.subagent openai:gpt-5.2     # or anthropic:claude-sonnet-4-6, google:gemini-1.5-pro, etc.
+gbrain agent run "research acme corp" --tools search,query --follow
+```
+
+The legacy Anthropic-direct path stays the default for one patch release so existing brains ship the same behavior on upgrade. Dogfood the new path locally, then flip the flag in the next release.
+
+What you'd see when picking providers:
+
+| Provider | Tool calls | Prompt caching | Notes |
+|---|---|---|---|
+| anthropic:claude-* | Yes | Yes | Cheapest on long loops thanks to cache; default |
+| openai:gpt-5.2 | Yes | No (implicit only) | Runs hot — cost scales linearly with conversation length |
+| google:gemini-1.5-pro | Yes | No | 1M-token context; good for big-context agents |
+| openrouter:* | Yes | Depends on underlying | The cost-arbitrage path |
+| openai-compatible (Ollama, LiteLLM, vLLM, llama-server) | If the model supports tools | No | Refused-at-submit when the model lacks tool calling |
+| voyage, zeroentropy | No chat touchpoint | n/a | Embeddings only — refused with a clear hint |
+
+`gbrain doctor` warns when your subagent tier resolves to a degraded provider (no prompt caching = higher cost) and refuses to dispatch when the provider doesn't support tool calling at all. The check is `subagent_capability` (was `subagent_provider`).
+
+**The remote MCP boundary also opens up — Cursor, Claude Code, ChatGPT can now launch gbrain agents over MCP**, not just observe them. The new op is `submit_agent`. Trust is bounded at OAuth client registration time: which tools the agent can call, which source/brain it can touch, which slug-prefixes it can write under, max concurrent jobs, and a per-client daily USD cap that uses a reserve-then-settle budget meter (the rate-leases.ts pattern over `pg_advisory_xact_lock`) so two concurrent agents from the same client can't both pre-flight at the cap boundary and bust it.
+
+To register a remote agent client (requires server-side gbrain v0.38+):
+
+```bash
+gbrain auth register-client cursor-agent \
+  --scopes read,agent \
+  --bound-tools search,get_page,put_page \
+  --bound-source default \
+  --bound-slug-prefixes wiki/ \
+  --bound-max-concurrent 3 \
+  --budget-usd-per-day 5.00
+```
+
+`gbrain` writes a JSONL audit row at `~/.gbrain/audit/agent-jobs-YYYY-Www.jsonl` per submission with (client, model, tools, slug_prefixes, max_concurrent, budget_remaining_cents, outcome). Prompt text itself never lands in the audit — only its byte count.
+
+Things to watch after upgrading:
+
+- `gbrain doctor` may warn `subagent_capability` if your `chat_model` is non-Anthropic and `ANTHROPIC_API_KEY` is unset and you haven't flipped `agent.use_gateway_loop=true` yet. The default still falls through the Anthropic-direct path; the warn surfaces this drift.
+- Existing `admin` OAuth clients do NOT automatically get the new `agent` scope. The two scopes are siblings (D13). Re-register with `--scopes admin,agent` and explicit bindings to opt in.
+- Mid-flight binary upgrade: jobs that were running with v0.37-shaped content_blocks reconcile via a read-time shim that recomputes the stable key from `(job_id, message_idx, content_blocks index, tool_name)`. No data migration; legacy rows replay correctly under the new key.
+- Migrations v82-v85 land on first `gbrain doctor` post-upgrade. (v81 was claimed by v0.38.0.0's `pages_provenance_columns`; v0.38.1.0's stable-ID + reservation + binding migrations renumbered up by one.)
+
+### What we built and how it slots together
+
+Four atomic slices behind feature flags, each shipping independently before the next:
+
+- **Slice 1** — gateway-native tool loop + stable IDs + v1→v2 shim. Pin removal at queue.ts, model-config rename, doctor check rename. Behind `agent.use_gateway_loop` (default off in this patch).
+- **Slice 2** — budget meter (reserve-then-settle via `pg_advisory_xact_lock`), `mcp_spend_reservations` table, `oauth_clients.budget_usd_per_day`.
+- **Slice 3** — `submit_agent` MCP op + `agent` OAuth scope + `oauth_clients.bound_*` columns + JSONL audit at `~/.gbrain/audit/agent-jobs-*.jsonl`.
+- **Slice 4** — admin `/admin/api/agents/spend` endpoint. Frontend wire-up follows in a near-term patch.
+
+### To take advantage of v0.38.1.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+   This applies migration v81 (`page_links_view_alias`) on PGLite + Postgres brains. The alias is required for `gbrain brainstorm` and `gbrain lsd` to work against the domain-bank tiebreaker; without it, the brainstorm domain-bank queries fail with `relation "page_links" does not exist`.
+2. **Set a cost cap on the commands you care about:**
+   ```bash
+   # Sets a per-run dollar ceiling. Throws BudgetExhausted before any LLM call
+   # if the pre-run estimate exceeds the cap, AND mid-run if cumulative spend
+   # blows past it.
+   gbrain brainstorm "test" --max-cost 1
+   gbrain doctor --remediate --max-cost 5
+   gbrain reindex --code --max-cost 10
+   ```
+3. **Verify the outcome:**
+   ```bash
+   gbrain doctor             # schema_version should be 81
+   gbrain brainstorm --list-runs   # confirms the new checkpoint directory exists
+2. **Try the new loop** (optional; off by default):
+   ```bash
+   gbrain config set agent.use_gateway_loop true
+   gbrain config set models.tier.subagent openai:gpt-5.2   # or your preferred provider
+   gbrain agent run "test the new loop" --tools search --follow
+   ```
+3. **Verify the schema** is at v85:
+   ```bash
+   gbrain doctor --json | grep schema_version
+   ```
+4. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+   This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
+## [0.38.0.0] - 2026-05-20
+
+**Your brain is now yours.**
+
+GBrain used to assume one shape: VC investor brain. People, companies, deals, meetings — those were the four corners. Everything else lived as `as PageType` casts the engine never enforced. Your real brain has 180+ types — `therapy-session`, `tweet-bundle`, `adversary-profile`, `book-analysis`, `apple-note`, plus 175 more. They worked through a polite fiction. The engine pretended you wrote VC software; you pretended back. v0.38 ends the pretense.
+
+PageType is now `string`. The closed 23-element union is gone. Schema packs declare your domain — types, link verbs, expert routing, facts eligibility, enrichment rubrics — and the engine consults the active pack instead of hardcoded literals. Five primitives compose: entity, media, temporal, annotation, concept. A research brain declares `paper`, `claim`, `method`, `researcher` and gets working search, expert routing, and facts extraction without forking the engine. A legal brain declares `case`, `statute`, `brief`. Your brain at `~/git/brain` keeps working unchanged because gbrain-base — the universal starter pack — reproduces today's behavior byte-for-byte.
+
+The path from "I have a brain" to "I have a schema matching my brain" is `gbrain schema use <pack>`. Five inspection + activation commands ship in v0.38: `active`, `list`, `show`, `validate`, `use`. The detect/suggest/init/fork/diff/graph/lint/explain surface follows in v0.39 — primitives are already in place.
+
+**Architecture decisions that survived three rounds of codex review:**
+
+- **Open type surface (D12).** PageType opens to `string`. ~30 `as PageType` casts widen to `as string` at engine SQL row boundaries. Compile-time exhaustiveness moves to the 5-element closed `PackPrimitive` enum where it's actually load-bearing.
+- **Explicit alias graph closure (E8 refinement of D12).** Pack types declare `aliases: []` explicitly. Closure walks the alias graph (BFS, depth cap 4, symmetric per declaration), not the primitive sibling set. This prevents `adversary-profile` from surfacing in `whoknows expert` just because it shares the `entity` primitive with `person` — codex finding #15 caught the silent bug in a prior model.
+- **Per-source closure CTE (D13).** Federated reads across sources `[A, B, C]` filter via a per-source CTE — each row classified by ITS source's pack rules, not the write-source pack's. Builder ships; engine wiring follows.
+- **Trust gate on per-call schema_pack (D13 + codex F4).** Per-call `schema_pack` opt is rejected for remote/MCP callers (`ctx.remote !== false`). CLI overrides freely. Same posture as v0.26.9 + v0.34.1.0 source-scope hardening.
+- **ReDoS guard via vm.runInContext (E6 + E9 + T24 spike).** Community pack regexes run with a 50ms per-regex timeout and a 500ms per-page cumulative budget. Catastrophic backtracking (`^(a+)+$` against 1MB) interrupts cleanly under Bun. One bad regex burns the page budget; remaining verbs degrade to `mentions` deterministically.
+- **Inline canonical closure snapshot for eval replay (E10 + E11).** `eval_candidates.schema_pack_per_source` JSONB stores `{source_id → {pack_name, pack_version, manifest_sha8, alias_closure_resolved}}`. Replay is self-contained; a year-old eval reproduces exactly even if the pack file evolved or was deleted.
+
+**How to turn it on**
+
+The migration is invisible:
+
+```bash
+gbrain upgrade
+gbrain schema active     # → gbrain-base (default, reproduces pre-v0.38)
+gbrain stats             # → identical to pre-upgrade
+```
+
+When you want your own shape:
+
+```bash
+gbrain schema list                       # see available packs
+gbrain schema show gbrain-base           # see what the default declares
+gbrain schema validate my-pack           # validate a pack manifest
+gbrain schema use my-pack                # activate (writes ~/.gbrain/config.json)
+```
+
+Author packs as YAML or JSON at `~/.gbrain/schema-packs/<name>/pack.yaml`:
+
+```yaml
+api_version: gbrain-schema-pack-v1
+name: research-state
+version: 0.1.0
+extends: gbrain-base
+page_types:
+  - name: paper
+    primitive: media
+    path_prefixes: [papers/]
+    aliases: []
+    extractable: true
+    expert_routing: false
+  - name: researcher
+    primitive: entity
+    path_prefixes: [researchers/]
+    aliases: [person]    # E8: surfaces person rows in researcher queries
+    extractable: true
+    expert_routing: true
+```
+
+**What's safe to know about**
+
+- **Existing brains see zero change.** gbrain-base is the default pack; every type/path/regex/rubric matches pre-v0.38 byte-for-byte. The migration is data-mutation-free: pages keep their `type` value; the engine consults the active pack at read time.
+- **180+ organic types now legal.** Pre-v0.38 your `apple-note` and `therapy-session` rows worked because the closed PageType union was already a fiction. v0.38 formalizes the open shape — no more `as PageType` ceremony, no compile-time barrier to writing your own types.
+- **takes.kind CHECK constraint dropped (migration v80).** Runtime validation against the active pack's `annotation` primitive `takes_kinds:` field replaces the hardcoded `IN ('fact','take','bet','hunch')`. gbrain-base preserves the 4 legacy kinds; research packs add `finding`, `hypothesis`; legal packs add `verdict`, `motion`.
+
+**What's NOT done yet (Phase B/C/D follow-up waves)**
+
+This ship lands the foundation. The primitives are in place; per-call-site wiring follows mechanically:
+
+- Per-call-site wiring of pack-aware variants in: postgres-engine.ts/pglite-engine.ts find_experts SQL, whoknows.ts DEFAULT_TYPES, link-extraction.ts inferLinkType + FRONTMATTER_FIELD_OVERRIDES callers, markdown.ts inferType callers, facts/eligibility.ts ELIGIBLE_TYPES, enrichment-service.ts entityType, enrichment/completeness.ts RUBRICS_BY_TYPE, cycle/synthesize+patterns subagent prompts.
+- Phase C CLI follow-ups: `detect`, `suggest`, `init`, `fork`, `edit`, `diff`, `graph`, `lint`, `explain`, `review-candidates`, `review-orphans`.
+- Phase D: 7 example packs (minimal-brain, person-first, media-archive, temporal-archive, research-notebook, founder-ops, personal-archive), schema-pack distribution as `.gbrain-schema` tarballs via the v0.37 skillpack pipeline (rename `.tgz` → `.gbrain-skillpack` for symmetry), full e2e test, author guide + cookbook.
+
+The full plan estimated 12-14 weeks across all four phases. v0.38.0.0 lands Phase A (engine flex foundation) + Phase B foundational primitives + Phase C minimal CLI surface as 16 atomic commits.
+
+## To take advantage of v0.38
+
+`gbrain upgrade` handles everything automatically — migrations v80 + v81 run via `gbrain apply-migrations`. If `gbrain doctor` warns about a partial migration:
+### Itemized changes
+
+**Added:**
+- `src/core/ai/capabilities.ts` — recipe-driven `getProviderCapabilities()` + `classifyCapabilities()` (5-state verdict: `ok` / `degraded:no_caching` / `degraded:no_parallel` / `unusable:no_tools` / `unknown`).
+- `src/core/ai/gateway.ts:toolLoop()` — provider-agnostic loop control wrapping `gateway.chat()`. Stateless beyond optional replay state; testable via existing `__setChatTransportForTests` seam.
+- `src/core/minions/budget-meter.ts` — reserve/settle/sweep + FNV-1a `clientLockKey` for `pg_advisory_xact_lock`.
+- `src/core/minions/agent-audit.ts` — ISO-week-rotated JSONL audit at `~/.gbrain/audit/agent-jobs-YYYY-Www.jsonl`. Never logs prompt text.
+- New MCP op `submit_agent` (scope `agent`, mutating, remote-callable) with per-dispatch binding enforcement.
+- `agent` OAuth scope (sibling to admin, NOT implied) + `oauth_clients.bound_tools` / `.bound_source_id` / `.bound_brain_id` / `.bound_slug_prefixes` / `.bound_max_concurrent` / `.budget_usd_per_day` columns.
+- `submit_agent` handler-time gateway-loop path inside `src/core/minions/handlers/subagent.ts`: builds `ChatToolDef[]` + `ToolHandler` Map from existing brain-tool registry, persists to v0.38 stable-ID columns at first observation, settles complete/failed on tool exit. D5 read-time shim adapts v1 Anthropic content blocks into v2 ChatBlock-shaped on read so crash-replay reconciles across the upgrade boundary.
+- Admin endpoint `GET /admin/api/agents/spend` returning per-client today's spend + pending reservations + inflight count.
+
+**Changed:**
+- `src/core/minions/queue.ts:87-106` — dropped `isAnthropicProvider` hard-reject; now refuses only on `unusable:no_tools` / `unknown` verdicts. Degraded providers pass with cost warn at first dispatch.
+- `src/core/model-config.ts:enforceSubagentAnthropic` → `enforceSubagentCapable`. Preserves once-per-(source,model) warn seam from v0.31.12. Legacy name kept as a thin back-compat wrapper.
+- `src/commands/doctor.ts:checkSubagentProvider` → `checkSubagentCapability`. Three verdict states: unusable, unknown, degraded:no_caching (cost regression warn).
+- `src/core/scope.ts` — `agent` added to allowed scopes (size 5 → 6). `IMPLIES` map keeps `agent` as a sibling, NOT implied by admin.
+- `src/core/operations.ts:operations` — `submit_agent` registered as a remote-safe mutating op alongside the existing Minions ops.
+
+**Migrations:**
+- v82 (`subagent_tool_executions_stable_id`) — adds `ordinal INTEGER`, `gbrain_tool_use_id UUID`, `UNIQUE(job_id, message_idx, ordinal)`. NULL-tolerant for legacy rows.
+- v83 (`mcp_spend_reservations`) — new table for reserve-then-settle pattern. Partial index on `(status, expires_at) WHERE status='pending'`.
+- v84 (`oauth_clients_budget_usd_per_day`) — `NUMERIC(10,2) NULL`.
+- v85 (`oauth_clients_agent_binding`) — bound_tools / bound_source_id (FK sources) / bound_brain_id / bound_slug_prefixes TEXT[] / bound_max_concurrent INTEGER DEFAULT 1.
+
+**Tests:**
+- `test/ai/capabilities.test.ts` (12 cases) — recipe-driven capability matrix across Anthropic / OpenAI / Google / Voyage (chat-touchpoint missing) / malformed input / unknown provider.
+- `test/ai/gateway-tool-loop.test.ts` (7 cases) — end stop_reason, single tool dispatch, callback ordering (write-ordering invariant), replay short-circuit on complete, non-idempotent pending replay throws unrecoverable, max_turns cap, refusal short-circuit.
+- `test/minions/budget-meter.test.ts` (15 cases) — FNV-1a determinism, reserve under/over cap, settle idempotency, sweep, getClientDailyCapCents.
+- `test/minions/agent-audit.test.ts` (7 cases) — ISO-week filename + year-boundary edge, JSONL append, NEVER logs prompt content.
+- `test/agent-cli.test.ts` updates — Layer 1/2/3 cases flipped: any tool-supporting provider passes; unknown / embedding-only provider refused.
+- `test/scope.test.ts` + `test/oauth.test.ts` + `test/model-config.serial.test.ts` updated for v0.38 semantics.
+
+**Plan:** `~/.claude/plans/system-instruction-you-are-working-shimmying-breeze.md`. Wave went through `/plan-ceo-review` (Option B locked), `/plan-eng-review` (7 decisions D3-D9), and two codex outside-voice rounds (D11-D13 absorbed; round 2 caught blocker on missing Slice 1 stable-ID migration + 4 non-blockers).
+
+
+## [0.38.0.0] - 2026-05-21
+
+**One command to capture anything into your brain. Local OR hosted, doesn't matter.**
+
+You type `gbrain capture "the thought I want to remember"` and the right
+thing happens. The page lands in your brain — both as a queryable row AND
+as a markdown file on disk, in one move. You see the slug come back as a
+five-line receipt. You can search for it 200ms later. If you piped from
+stdin or pointed at a file, same deal. If you're on a hosted brain
+(thin-client install), it routes through MCP to the server transparently
+— same command, same UX.
+
+Pre-v0.38 the answer to "how do I get a thought into the brain?" was
+three different answers depending on context: `put_page` over MCP (DB
+only, file drifts), commit a file then run sync (works but commit-then-
+sync is friction), or autopilot wait (poll every 5min, latency-bound).
+v0.38 collapses these into one mental model: **the brain is a markdown
+file tree wherever the DB lives, and `gbrain capture` is the front door.**
+
+### How to use it
+
+```
+gbrain capture "remember to follow up on X"
+gbrain capture --file ./notes/today.md
+echo "from a pipe" | gbrain capture --stdin
+SLUG=$(gbrain capture "..." --quiet)   # script-friendly
+gbrain capture "..." --json            # for agents
+```
+
+### The plumbing
+
+| Surface | What it does |
+|---|---|
+| `gbrain capture` | Single human-facing entrypoint. Local installs route through `put_page` directly; thin-client installs route through `callRemoteTool('put_page', ...)`. Same UX both ways. |
+| `put_page` write-through | After a page lands in the DB, the markdown file is written to disk too. Closes the drift class the v0.35.6.0 phantom-redirect pass was cleaning up. Subagent sandbox + dry-run writes stay DB-only. |
+| `POST /ingest` on `serve --http` | OAuth-gated webhook so Zapier / IFTTT / Apple Shortcuts can drop into your brain. Tagged `untrusted_payload: true`; rate-limited; 1MB cap; content-type allowlist. |
+| `IngestionSource` contract | Versioned public API at `gbrain/ingestion` and `gbrain/ingestion/test-harness` package subpaths. Third-party skillpack publishers can build sources (Granola, Linear, voice, OCR) against the contract. |
+| Ingestion daemon | Supervises file-watcher + inbox-folder + future built-in sources. Per-source crash-counter + exponential backoff (the v0.34.3.0 ChildWorkerSupervisor pattern adapted for in-process modules). 24h content-hash dedup window. Per-source rate limit. |
+| file-watcher source | chokidar-based watcher over your brain repo. 1s debounce coalesces editor save-storms. Honors `pruneDir` (single source of truth with sync). Linux ENOSPC surfaces a paste-ready sysctl hint. |
+| inbox-folder source | Drop a file into `~/.gbrain/inbox/` from iOS Shortcuts / AirDrop / Drafts / Finder. Daemon picks it up, ingests, auto-archives to `.archived/YYYY-MM-DD/`. |
+| `IngestionTestHarness` | Publisher-facing test utility with fake clock + in-memory event bus + `expectEvent` matchers. Exported as a versioned public API so skillpack authors can write unit tests without spinning up a daemon. |
+
+### Provenance
+
+Every page captured via the v0.38 paths now carries provenance frontmatter:
+
+```yaml
+ingested_via: put_page              # local CLI
+ingested_via: 'mcp:put_page'        # MCP remote
+ingested_via: capture-cli           # via `gbrain capture`
+ingested_via: webhook               # via POST /ingest
+ingested_at: 2026-05-21T04:15:00Z
+```
+
+Migration v80 adds the four nullable columns (`ingested_via`,
+`ingested_at`, `source_uri`, `source_kind`). Historical pages stay
+NULL — pre-v0.38 pages never had provenance and the columns are
+additive.
+
+### IngestionSource contract for skillpack authors
+
+```ts
+import { IngestionSource, IngestionEvent } from 'gbrain/ingestion';
+import { IngestionTestHarness, expectEvent } from 'gbrain/ingestion/test-harness';
+
+export default function createSource(config: Record<string, unknown>): IngestionSource {
+  return {
+    id: 'voice-granola',
+    kind: 'voice-whisper',
+    async start(ctx) {
+      // Poll Granola, emit events:
+      ctx.emit({
+        source_id: 'voice-granola',
+        source_kind: 'voice-whisper',
+        source_uri: 'granola://transcript/123',
+        received_at: new Date().toISOString(),
+        content_type: 'text/markdown',
+        content: transcript,
+        content_hash: computeContentHash(transcript),
+      });
+    },
+    async stop() { /* drain */ },
+  };
+}
+```
+
+Declared in `gbrain.plugin.json` with `api_version: 'gbrain-ingestion-source-v1'`. Mismatched API versions fail loudly with a paste-ready upgrade hint, never silently break. Both subpaths are pinned by `test/public-exports.test.ts` so breaking the contract is a major-version change.
+
+### What this commit ships
+
+- v0.38 ingestion substrate: ~1500 LOC + ~150 LOC tests across 6 modules (types, dedup, daemon, skillpack-load, test-harness, two built-in sources)
+- POST /ingest webhook source on `serve --http`
+- `ingest_capture` Minion handler
+- `put_page` write-through (server-side, source-aware filing layout)
+- `serializePageToMarkdown` + `resolvePageFilePath` DRY extract (synthesize.ts dream-cycle render is now a 4-line wrapper)
+- Migration v80 — provenance columns on `pages`
+- `gbrain capture` CLI verb
+- 271+ new test cases across ingestion + commands + public-exports
+
+### Itemized changes
+
+- `src/core/ingestion/types.ts` (NEW) — IngestionSource + IngestionEvent + IngestionSourceContext + validateIngestionEvent + computeContentHash + IngestionEventError + INGESTION_SOURCE_API_VERSION + INGESTION_CONTENT_TYPES
+- `src/core/ingestion/dedup.ts` (NEW) — 24h content-hash LRU with 5000-entry cap
+- `src/core/ingestion/skillpack-load.ts` (NEW) — `gbrain.plugin.json` discovery with api_version compat + collision policy + in-process trust model for v1
+- `src/core/ingestion/test-harness.ts` (NEW) — publisher-facing test utility exported as `gbrain/ingestion/test-harness`
+- `src/core/ingestion/daemon.ts` (NEW) — IngestionDaemon: SourceSupervisor pattern + validate → dedup → rate-limit → dispatch pipeline + health surface
+- `src/core/ingestion/sources/file-watcher.ts` (NEW) — chokidar source with 1s debounce, atomic-write handling, ENOSPC sysctl-hint surfacing
+- `src/core/ingestion/sources/inbox-folder.ts` (NEW) — Shortcuts/AirDrop target with auto-archive to `.archived/YYYY-MM-DD/`
+- `src/core/ingestion/index.ts` (NEW) — barrel for `gbrain/ingestion`
+- `src/core/minions/handlers/ingest-capture.ts` (NEW) — `ingest_capture` Minion handler with slug-resolution fallback chain
+- `src/commands/serve-http.ts` — POST /ingest webhook route with OAuth write scope + rate limit + content-type allowlist + 1MB payload cap + `untrusted_payload: true` tagging
+- `src/commands/jobs.ts` — registers `ingest_capture` in `registerBuiltinHandlers`
+- `src/core/operations.ts` — put_page write-through after `importFromContent` with trust gating (subagent sandbox / dry-run stay DB-only) + provenance frontmatter stamp
+- `src/core/markdown.ts` — `serializePageToMarkdown(page, tags, opts)` + `resolvePageFilePath(brainDir, slug, sourceId)` DRY extract
+- `src/core/cycle/synthesize.ts` — `renderPageToMarkdown` becomes a 4-line wrapper around `serializePageToMarkdown`
+- `src/core/migrate.ts` — migration v81 `pages_provenance_columns` adds 4 nullable columns (renumbered from v80 during master merge with v0.37.2.0 takes hotfix)
+- `src/commands/capture.ts` (NEW) — `gbrain capture` CLI verb with local + thin-client routing, --file / --stdin / --slug / --type / --source / --quiet / --json
+- `src/cli.ts` — registers `capture` dispatch case + `CLI_ONLY` entry
+- `package.json` — adds `chokidar` dep + `gbrain/ingestion` + `gbrain/ingestion/test-harness` exports
+- `test/public-exports.test.ts` + `scripts/check-exports-count.sh` — pin new public subpaths (count 18 → 20)
+
+### Deferred to follow-up releases
+
+These were in the v0.38 plan but did not land in this release:
+
+- Daemon rename `gbrain autopilot` → `gbrain ingest` with forever-alias + launchd plist migration
+- cron-scheduler skill refactor + OpenClaw credential auto-migrate (the existing skill still works untouched; the migration into a daemon-side source ships in a follow-up)
+- Content-type processors (PDF text extract, image OCR, audio transcribe, video keyframe). The webhook source currently rejects binary content_types with HTTP 415 and a paste-ready hint; processors land as skillpack-distributed sources.
+- `gbrain doctor` inotify-limit probe (Linux) — chokidar still surfaces ENOSPC at runtime with the sysctl hint; the doctor-time static probe is a polish item.
+- Publisher DX cathedral: `gbrain skillpack init --kind=ingestion-source <name>` scaffold extension, `gbrain ingest test [--watch]`, `gbrain ingest tail <source-id>`, `gbrain ingest validate <path>`. The IngestionTestHarness export is the foundation publishers can use today; the CLI helpers come next.
+- Skillpack reference pack at `examples/skillpack-ingestion-reference/` and the 3-stage tutorial in `docs/ingestion-source-skillpack.md`.
+
+These do not block the v0.38 release: the substrate is shipped and queryable; sources can be built against the contract today using the IngestionTestHarness; the cathedral commits add polish around the publisher experience.
+
+## To take advantage of v0.38.0.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+## [0.37.11.0] - 2026-05-21
+
+**Fresh `gbrain init --pglite` works out of the box now.**
+
+Before this release a brand-new install was broken: `gbrain init --pglite` made a brain whose schema didn't match what the embed pipeline actually used, so the first `gbrain embed --stale` failed every page with a vector dimension error. The default model the gateway shipped (ZeroEntropy at 1280 dimensions) and the default column the schema created (OpenAI's 1536) silently disagreed, and every documented escape hatch was also broken: `gbrain config set embedding_model X` wrote to a database table the embed pipeline doesn't read, the doctor remediation hint pointed at that no-op command, and the docs prescribed `ALTER COLUMN TYPE vector(N)` which fails on PGLite because pgvector ships as embedded WASM. The user spent an hour in source code to figure out you had to hand-edit `~/.gbrain/config.json` after init — completely undocumented. This release closes the bug class end-to-end.
+
+### How to upgrade
+
+```bash
+gbrain upgrade
+# Already on a 1536-d brain that works? You don't have to do anything.
+# Starting fresh or wanting to switch models? Use the new one-liner:
+gbrain reinit-pglite --embedding-model zeroentropyai:zembed-1 --embedding-dimensions 1280
+```
+
+### What's new for everyone
+
+- **`gbrain init --pglite` produces a vector(1280) schema by default** that matches the embed model the gateway actually uses. Embedding succeeds on the first call. Init prints the resolved choice up front so you see what shipped: `Embedding: zeroentropyai:zembed-1 (1280d) [default]`.
+- **`gbrain reinit-pglite --embedding-model X --embedding-dimensions N`** — single-command wipe-and-reinit for switching providers on PGLite. Backs up the brain to `.bak`, runs init with the new flags, re-syncs the brain repo. `--no-sync` to defer the resync, `--yes` to skip the TTY confirmation, `--json` for scripts.
+- **`gbrain init` re-run no longer destroys your settings.** Existing `~/.gbrain/config.json` fields are merged on top of new init flags, so re-running with no args preserves `embedding_model`, `chat_model`, API keys, and every other field you set.
+- **`gbrain sync --help` actually documents `--no-embed` now.** The flag has existed for releases but was unreachable through `--help` because sync wasn't wired into the dispatcher's self-help set.
+- **`gbrain config set embedding_model X` refuses with the right recipe.** That command wrote to the DB plane while the embed pipeline read the file plane, so it silently lied for releases. It now exits 1 with a paste-ready wipe-and-reinit recipe pointing at the engine you're actually running on (`gbrain reinit-pglite` on PGLite, the `ALTER COLUMN` SQL recipe on Postgres). No `--force` escape — keeping the no-op write path was the original footgun.
+- **ZeroEntropy API key plumbing works.** Before this release the embed pipeline only mapped `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from your config into the gateway env, so `zeroentropy_api_key` in `~/.gbrain/config.json` was dead config. Now it propagates correctly. `ZEROENTROPY_API_KEY` env var also routes through.
+- **`gbrain embed --stale` fails fast with a paste-ready recipe** when the schema column and the gateway disagree. Pre-fix the worker pool would fire 20 parallel API calls into dim-rejected inserts and surface only the raw Postgres error. Now you see the wipe-and-reinit recipe before any embed call goes out.
+- **`gbrain sync` surfaces the recipe + `--no-embed` tip** when its inline embed step hits a dim mismatch. Previously the sync step silently swallowed embed errors at two different catch sites. Both sites now print the recipe.
+- **`gbrain doctor` reads the embed checks from the gateway, not the DB plane.** The width-consistency and ZE-key checks were stale on fresh installs whose DB rows hadn't been written yet. They now see what the embed pipeline sees. Provider-aware key detection too: a ZE brain no longer looks "healthy" because `OPENAI_API_KEY` happens to be set.
+
+### What's new for contributors
+
+- **New `src/core/ai/defaults.ts` leaf module** is the canonical source for `DEFAULT_EMBEDDING_MODEL` and `DEFAULT_EMBEDDING_DIMENSIONS`. Eight other places used to hardcode `'text-embedding-3-large'` / `1536` independently — those are all migrated to import from defaults.ts. Changing the default in one place now propagates correctly. Includes the PGLite + Postgres engine fallbacks, both `getPGLiteSchema()` / `getPostgresSchema()` default args, the embedding-column registry's builtin row, the chunk-row INSERT default, and the schema seed (which previously stripped the provider prefix and stored bare `zembed-1` instead of `zeroentropyai:zembed-1`).
+- **New `loadConfigFileOnly()` in `src/core/config.ts`** is the safe write-back source for `gbrain init` 's config merge. Pre-fix init called `loadConfig()` (which merges env vars + infers engine from `DATABASE_URL`) to read existing config before saving — so any transient env value would get baked into `~/.gbrain/config.json`. The new helper reads the JSON file only.
+- **`embeddingMismatchMessage()` takes an `engineKind` argument now.** PGLite branch emits the new `gbrain reinit-pglite` recipe; Postgres branch keeps the SQL ALTER. The `databasePath` arg lets the recipe use the brain's actual path instead of `~/.gbrain/brain.pglite` (honors `GBRAIN_HOME`, `--path` overrides).
+- **`EmbeddingDimMismatchError` is a tagged class exported from `src/commands/embed.ts`.** `runEmbedCore` pre-flights via the existing `readContentChunksEmbeddingDim` helper and throws this error before the worker pool starts. Sync catches it specifically for the recipe + `--no-embed` tip.
+- **CDX2-5+6 from codex review:** the ZE key fix v1 landed in the wrong file (`gateway.ts:configureGateway` instead of `cli.ts:buildGatewayConfig`). Round 2 caught + fixed it. Pinning regression at `test/v0_37_fix_wave.test.ts`'s Lane C.3 describe.
+- **30+ unit tests + 1 in-process E2E** cover every lane. Highlights: `test/v0_37_fix_wave.test.ts` (structural lane assertions), `test/v0_37_gap_fill.test.ts` (end-to-end behavior + reinit-pglite contracts), `test/e2e/fresh-install-pglite.test.ts` (headline scenario via `__setEmbedTransportForTests` mock). The legacy `test/embedding-dim-check.test.ts` and `test/doctor-ze-checks.test.ts` and `test/search/embedding-column.test.ts` are also updated for the new behaviors.
+- **`bunfig.toml` preload** at `test/helpers/legacy-embedding-preload.ts` configures the gateway to OpenAI/1536 once per shard process, so the 20+ test files that hardcode `new Float32Array(1536)` fixtures keep working without per-file edits.
+- 26 codex outside-voice findings across two review rounds folded into the plan before code landed. Plan file: `~/.claude/plans/system-instruction-you-are-working-piped-mitten.md`.
+
+### Deferred to follow-up
+
+Filed in TODOS.md:
+- `gbrain embed --try-fallback` for provider quota/auth failures (silent provider switching would corrupt retrieval; needs explicit consent design).
+- Full plane unification for non-schema-sizing fields (`chat_model`, `expansion_model`, `reranker_model` could become DB-live-mutable — audit pending).
+- Worker-pool shared `AbortController` in `embedAll()` as defense-in-depth on top of the entry-point pre-flight.
+- Cleanup of back-compat constants in `src/core/embedding.ts` (legacy `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` exports for old tests).
+
+### To take advantage of v0.37.11.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a dim mismatch:
+
+1. **Confirm everything's in order:**
+   ```bash
+   gbrain doctor
+   # Expect: embedding_width_consistency ok, ze_embedding_health ok
+   ```
+2. **If you want to switch embedding models on PGLite (now or in the future):**
+   ```bash
+   gbrain reinit-pglite --embedding-model zeroentropyai:zembed-1 --embedding-dimensions 1280
+   ```
+3. **If `gbrain doctor` flags a width mismatch,** the message now includes a paste-ready recipe for your specific engine kind (PGLite or Postgres). Run it.
+4. **If any step fails,** please file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor`.
+
+## [0.37.10.0] - 2026-05-21
+
+**Fresh installs of gbrain now auto-detect your embedding provider from API keys in your environment. If you have `OPENAI_API_KEY` set, you get OpenAI. If you have multiple keys, gbrain asks. If you have no keys in a CI build, it fails loud at init with a paste-ready setup hint, not silently four minutes later at first import.**
+
+A user on WSL ran `bun install && gbrain init --pglite && gbrain import …`, hit a wall ("expected 1536 dimensions, not 1280"), and recovered with five commands including `rm -rf ~/.gbrain` and three config keys that gbrain silently ignored (`embedding.provider`, `embedding.model`, `embedding.dimensions`). The root cause was a multi-defect bug class: init didn't peek at env vars, didn't persist the resolved provider unless you passed a flag, didn't validate the schema/dim invariant before creating the schema, and `gbrain config set` accepted unknown keys without complaining. This release closes every one of those.
+
+How to use it (already on after upgrade):
+
+```
+gbrain init --pglite                                    # auto-pick from env (one key → that provider)
+gbrain init --pglite                                    # picker fires when multiple keys are set
+gbrain init --pglite --no-embedding                     # opt-in deferred setup mode
+gbrain config set embedding.provider openai             # now exits 1 with "did you mean embedding_model?"
+gbrain config set foo.unknown bar --force               # escape hatch with loud stderr WARN
+```
+
+What you'd see in concrete scenarios:
+
+| Scenario | Before v0.37.10.0 | After |
+|---|---|---|
+| `OPENAI_API_KEY` set, run `init --pglite` | Silent ZE 1280d default, schema becomes `vector(1536)`, first import explodes | Auto-picks `openai:text-embedding-3-large` (1536d), config persisted, import succeeds |
+| `OPENAI_API_KEY` + `VOYAGE_API_KEY` both set | Same silent ZE default | Interactive picker fires, user chooses |
+| No keys, non-TTY (Docker `RUN`) | Silent broken state | Exit 1 with paste-ready `export OPENAI_API_KEY=...` hint |
+| `OPENAPI_API_KEY=sk-…` (typo) | Silent broken state | Exit 1 + "did you mean OPENAI_API_KEY?" suggestion |
+| `--embedding-dimensions 9999` (invalid) | Silently created broken schema, exploded at first embed | Preflight rejects BEFORE any disk write |
+| `gbrain config set embedding.provider openai` | Silently accepted, no-op | Exit 1, suggests `embedding_model`. `--force` overrides with stderr WARN |
+
+If you upgrade and `gbrain doctor` warns about a silent-default v0.36 install (vector(1536) column + empty config), it now prints the exact repair command. For an empty brain, that's `gbrain init --force --embedding-model <id>`. For a populated brain, `gbrain retrieval-upgrade --to <id> --reindex`. You should never need `rm -rf ~/.gbrain` again.
+
+Things to watch:
+
+- **Behavior change for CI/Docker.** Bare `gbrain init --pglite` in a non-TTY context with no provider key now exits 1. If your image build runs init before the runtime env is populated, set the key at build time OR pass `--no-embedding` and configure at runtime. See [`docs/operations/headless-install.md`](docs/operations/headless-install.md) for both patterns.
+- **Behavior change for `config set`.** Unknown keys now exit 1 by default. Downstream tooling that legitimately writes new keys must pass `--force`. The full list of recognized keys is `KNOWN_CONFIG_KEYS` in `src/core/config.ts`.
+- **Local providers (Ollama, llama-server) are no longer auto-picked.** They have no required API key, which previously made them count as "always env-ready" and silently win when the user clearly intended a hosted provider. They stay accessible via explicit `--embedding-model ollama:<model>`.
+
+### Itemized changes
+
+- **`src/core/levenshtein.ts`** (NEW) — small ~50-line `editDistance(a, b)` + `suggestNearest(input, candidates, maxDistance)` helper. Used by `gbrain config set` for "did you mean?" suggestions and by init for env-var typo detection.
+- **`src/core/embedding-dim-check.ts`** — three new pure functions: `resolveSchemaEmbeddingDim(opts)` and `resolveSchemaMultimodalDim(opts)` validate the resolved dim against recipe's `default_dims` plus per-provider Matryoshka allow-lists (OpenAI text-3, Voyage flexible-dim models, ZeroEntropy zembed-1) BEFORE any DB write; `EmbeddingDisabledError` + `assertEmbeddingEnabled(cfg)` guard the deferred-setup runtime path. New `PGVECTOR_COLUMN_MAX_DIMS = 16000` exported constant.
+- **`src/commands/init-provider-picker.ts`** (NEW) — interactive picker mirroring `init-mode-picker.ts`. Filters candidate recipes to env-ready ones, prompts via `readLineSafe`, surfaces the subagent-Anthropic caveat when picking a non-Anthropic chat-capable recipe without `ANTHROPIC_API_KEY` set. Exports `printSubagentAnthropicCaveat(write)` for reuse from `initPGLite` and `initPostgres` so the post-init auto-pick path also surfaces it.
+- **`src/commands/init.ts:resolveAIOptions`** — rewritten with a per-touchpoint env-detection tier. Precedence: explicit flag → shorthand → env auto-pick (group by provider id, codex finding #2) → picker (TTY) or fail-loud (non-TTY). Each touchpoint (embedding / expansion / chat) resolves independently. New `--no-embedding` opt-in flag for D9 deferred-setup mode. Exported `groupReadyByProvider(touchpoint, env)` + `findEnvKeyTypos(env)` for unit testing.
+- **`src/commands/init.ts:initPGLite` + `initPostgres`** — drop the conditional `configureGateway` gate so the schema substitution and runtime gateway use one resolved dim. Preflight `resolveSchemaEmbeddingDim` BEFORE `engine.initSchema()` — invalid dim refuses with paste-ready hint, no disk write. Atomic config persist (either resolved tuple or `embedding_disabled: true` sentinel, never partial). Post-init invariant assertion stays as regression guardrail. Subagent caveat fires post-init for both auto-pick + picker paths when chat_model is non-Anthropic AND `ANTHROPIC_API_KEY` is missing.
+- **`src/commands/providers.ts`** — extract `formatRecipeTable(recipes, env)` helper from `runList` so the picker and `gbrain providers list` can't drift. Add a stderr warn line to `providers test` when the tested model differs from the configured default ("Note: tested X in isolation; gbrain's configured embedding is Y — this test does NOT verify your brain's active path.") — codex finding #10.
+- **`src/commands/config.ts`** — strict unknown-key rejection with `--force` escape hatch. Levenshtein suggestion against `KNOWN_CONFIG_KEYS` + `KNOWN_CONFIG_KEY_PREFIXES` (well-known prefixes like `search.`, `models.`, `dream.` accept sub-keys without `--force`). Bug-reporter's three no-op config keys now all exit 1 with the right suggestion.
+- **`src/core/config.ts`** — adds `embedding_disabled?: boolean` to `GBrainConfig` (D9 sentinel). Exports `KNOWN_CONFIG_KEYS` (60+ canonical config keys, both file-plane and DB-plane) + `KNOWN_CONFIG_KEY_PREFIXES` (well-known prefixes for namespaced keys).
+- **`src/commands/embed.ts`** + **`src/commands/import.ts`** — `runEmbedCore` and `runImport` consult `assertEmbeddingEnabled(loadConfig())` and refuse cleanly with a `gbrain config set embedding_model <id>` hint when `embedding_disabled: true` is set. `gbrain import --no-embed` flag still works (chunks land without vectors).
+- **`src/commands/doctor.ts`** — `embedding_provider` check extended for the v0.36 silent-default repair case. Empty-brain vs non-empty-brain repair branching (drop-and-re-init vs `gbrain retrieval-upgrade`). `subagent_provider` check (v0.31.12) extended per D7 to warn when `chat_model` is non-Anthropic AND `ANTHROPIC_API_KEY` is missing.
+- **`src/commands/reindex-multimodal.ts`** — preflight `resolveSchemaMultimodalDim` BEFORE the reindex sweep, mirroring the text-side contract from `initPGLite`.
+- **`src/core/pglite-engine.ts` + `src/core/postgres-engine.ts`** — empty brain (`pageCount === 0`) now scores **100/100**, not 0/100. Vacuous truth: an empty brain has no coverage problem to penalize. Pre-fix, fresh `gbrain init --pglite` users saw `Brain score 0/100` on first `gbrain doctor` run, which was structurally surprising. Same fix on both engines, breakdown components unchanged for non-empty brains.
+- **`test/levenshtein.test.ts`** (18 cases), **`test/embedding-dim-check.test.ts`** (23 cases, extended), **`test/providers.test.ts`** (10 cases), **`test/init-provider-picker.test.ts`** (7 cases), **`test/init-env-detection.test.ts`** (21 cases), **`test/config-set.test.ts`** (19 cases) — 98 new unit cases pinning the env-detection grouping, Matryoshka validation, picker caveat behavior, Levenshtein suggestions, and bug-reporter regression for the three no-op keys.
+- **`test/e2e/init-fresh-pglite.test.ts`** (NEW, 14 E2E cases) — subprocess-driven verification of the full happy path, D3 non-TTY fail-loud (with and without env-key typos), D6 regression for the bug-reporter's three no-op config keys, D9 deferred-setup mode + import refusal, D11 preflight refusal without disk writes, and explicit-flag-wins-over-env precedence.
+- **`docs/integrations/embedding-providers.md`** — TL;DR table refreshed; added "Init resolves your provider from env keys" section and "If first import fails" troubleshooting block.
+- **`docs/operations/headless-install.md`** (NEW) — Docker/CI sequencing guide covering both build-time-key and runtime-key (`--no-embedding`) patterns.
+- **`README.md`** — added Troubleshooting section with one-paragraph repair hint and links to the headless-install + provider docs.
+- **`TODOS.md`** — closed the deferred v0.32.x "interactive provider chooser" entry as SUPERSEDED. Added four follow-up entries: dedicated migration script for v0.36 broken installs (telemetry-gated), namespaced extension fields for `config set --force` polish, runtime config-key inventory audit, and value-level Levenshtein on `config set`.
+
+### For contributors
+
+- The full eng-review decision trail (D1-D14) is at `~/.claude/plans/system-instruction-you-are-working-enumerated-mccarthy.md`.
+- 79 new unit tests + 14 new E2E tests. Total suite at 8200+ passing.
+
+## To take advantage of v0.37.10.0
+
+`gbrain upgrade` should pick this up automatically. If `gbrain doctor` warns about a v0.36 silent-default install:
+
+1. **Run the suggested repair from the doctor output.** Empty brain → `gbrain init --force --pglite --embedding-model <id>`. Non-empty brain → `gbrain retrieval-upgrade --to <id> --reindex`.
+2. **For CI/Docker:** review whether your image-build path runs `gbrain init --pglite` without an API key present. If so, switch to either Pattern 1 (key at build) or Pattern 2 (`--no-embedding` opt-in + runtime config) from `docs/operations/headless-install.md`.
+3. **For downstream tooling writing config keys:** if you have scripts that `gbrain config set` an unknown key (e.g. a custom plugin), pass `--force` to keep them working. Or migrate to a known prefix (`search.X`, `dream.X`, `models.X`).
+4. **Verify:**
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name=="embedding_provider")'
+   # Expect status=ok
+   ```
+5. **If any step fails,** file an issue at https://github.com/garrytan/gbrain/issues with `gbrain doctor` output. The new doctor surface should give a paste-ready repair; if not, that's a bug we want to know about.
+
+## [0.37.9.0] - 2026-05-20
+
+**Tags get written the same way everywhere now.**
+
+v0.37.5.0 fixed the doctor (it stopped flagging `tags: ["yc", "w2025"]` as broken). This release lines up everything else with that fix. When gbrain itself emits a tag list (inferred frontmatter on import, or `frontmatter validate --fix` rewriting a file), it writes `tags: ['yc', 'w2025']` in the canonical single-quote form. Your new pages and your repaired pages now look the same in `git diff`. No more cosmetic noise.
+
+If a tag actually contains an apostrophe like `Men's Fashion`, it falls back to double quotes, so YAML stays valid without ugly `''` escaping.
+
+**Skill update for agents that write into gbrain:** the `frontmatter-guard` skill now has a Prevention section showing the canonical YAML shapes side by side. Future agents should write the single-quote form on the first try.
+
+**How to use it**
+
+```bash
+gbrain upgrade
+# Existing files stay valid. Only new writes use the canonical form.
+# To normalize an existing brain's tag style:
+gbrain frontmatter validate <path> --fix
+```
+
+The `--fix` pass now rewrites `tags: ["yc", "w2025"]` to `tags: ['yc', 'w2025']` in place, with a backup under `~/.gbrain/backups/frontmatter/`. Only `tags:` and `aliases:` are touched. Other typed arrays (`metrics: ["1", "2"]`, `scores: ["a", "b"]`) are left alone on purpose, because rewriting them could change what gbrain reads them as.
+
+**What's safe to know about**
+
+- This is canonical-style normalization, not a bug fix. Both forms (`["yc"]` and `['yc']`) parse to the same array `['yc']` and hash identically in storage. The v0.37.5.0 validator already accepts both. This release is about making gbrain's own writes consistent with each other.
+- The auto-fix engine and the validator share a dedup gate. A file with both a JSON-array tag rewrite and a nested-quote title rewrite produces ONE `NESTED_QUOTES` audit entry, not two, so `frontmatter_integrity` counts stay honest about distinct files affected.
+- The validator gained a parity test that pins agreement between per-value `safeLoad` parsing and `gray-matter`'s full-document parse on the load-bearing inputs. Catches future per-value parse drift before it ships.
+
+**Why this is a small release**
+
+The hard problem was the validator (shipped in v0.37.5.0). What's left is alignment: the emitter, the auto-fix engine, and the agent guidance. Each piece touches one place and ships with its own tests. The "auto-heal on put_page" idea explored during planning was dropped after Codex's outside-voice review pointed out that `put_page` parses YAML into typed fields and hashes them, so single-quoted vs double-quoted arrays are functionally identical in storage. The fix lives where the writes happen, not on the read path.
+
+### Itemized changes
+
+#### Added
+
+- `src/core/brain-writer.ts:155-220` — new step 3a in `autoFixFrontmatter()`. Allow-listed to `tags:` / `aliases:` keys (`^(\s*(tags|aliases)\s*:\s*)\[(.*)\]\s*$`). Rewrites JSON-style double-quoted items to single-quoted YAML; items containing `'` fall back to double quotes via `JSON.stringify`. Empty items render as `''`. Idempotent.
+- `src/core/brain-writer.ts:154` — shared `nestedQuotesFixed` dedup gate between step 3a and existing step 3. One `NESTED_QUOTES` fix record per file when both fire.
+- `skills/frontmatter-guard/SKILL.md:170-217` — new "Prevention — Writing Valid Frontmatter" section. Correct/incorrect YAML examples, explanation of why `JSON.stringify`-style arrays are valid-but-non-canonical post-v0.37.5.0, and a quoting decision rule.
+- `test/brain-writer.test.ts` — 7 new cases for step 3a (JSON-array rewrite, apostrophe fallback, empty item, non-allow-list keys untouched, `aliases:` parity, step 3a + step 3 dedup, idempotency).
+- `test/markdown-validation.test.ts` — parity test covering the per-value-safeLoad vs gray-matter-full-document axis. Pins the load-bearing inputs the validator must agree with itself on, so a future per-value parse drift surfaces as a test failure not a silent flag-storm.
+
+#### Changed
+
+- `src/core/frontmatter-inference.ts:411-416` — `serializeFrontmatter()` emits `tags: ['yc', 'w2025']` (single-quoted) by default; falls back to `JSON.stringify` (double-quoted) only when a tag contains `'`. Aligns inferred-frontmatter output with the auto-fix engine.
+- `test/frontmatter-inference.test.ts:239` — updated assertion to match new canonical output; added apostrophe-fallback regression case.
+
+#### Removed
+
+- `TODOS.md` — closed out the "v0.37.5.0 NESTED_QUOTES validator follow-up" entry (unify `serializeFrontmatter` quoting with `brain-writer.ts:184` style). Resolved by this release.
+
+#### For contributors
+
+- The auto-fix engine's key-scope decision matters. If a future need shows up to normalize arrays for keys beyond `tags`/`aliases` (e.g. an `authors:` field), extend the regex allow-list explicitly. Don't broaden to `[A-Za-z_][\w-]*` — that would rewrite typed-numeric arrays (`scores: ["1", "2"]`) into string arrays and break downstream typed-claim extraction.
+- Codex outside-voice review on this wave produced 11 findings; 1 dropped a planned layer (put_page auto-normalization, because storage hashes parsed fields not raw bytes), 1 narrowed the allow-list, 5 fixed plan housekeeping. Original PRs #1217 (closed, serializer fix) and #1238 (closed, four-layer defense-in-depth) absorbed into this wave.
+## [0.37.8.0] - 2026-05-20
+
+**For agents indexing source code with gbrain, the right embedding model is now obvious — and the brain tells you so out loud.**
+
+If you point a gbrain instance at a repo full of source code (the gstack per-worktree code-brain pattern) and you embed with OpenAI's text-embedding-3-large, you're leaving real retrieval quality on the table. Voyage publishes voyage-code-3, a code-tuned embedding model with head-to-head numbers above their general flagships on code retrieval. The model was already registered in gbrain since pre-v0.33, but nothing in the discovery path said "use this for code." The decision tree in the docs routed to voyage-4-large. The Topology 3 setup section said zero about embedding choice. `gbrain reindex --code` happily embedded with whatever you had configured. The recommendation was hiding in plain sight.
+
+This release closes the discovery gap on four surfaces. The embedding-providers doc grows a "Code-heavy brain" branch in the decision tree. Topology 3 in the architecture doc gets a "Recommended embedding model" subsection with a paste-ready `gbrain init --pglite --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024`. The setup skill points at it. And `gbrain reindex --code` itself prints a short stderr nudge when the configured embedding model isn't code-tuned, with the exact `gbrain config set` lines you'd run to switch. Opt out per-environment with `GBRAIN_NO_CODE_MODEL_NUDGE=1` if you're on OpenAI for compliance or single-vendor procurement.
+
+Same diff also fixes a smaller bug that would have made the nudge land badly. Before v0.37.8.0, `gbrain reindex --code` printed its cost preview with a hardcoded `text-embedding-3-large` model name, even when you had `voyage:voyage-code-3` configured. The constant was a v0.13-era back-compat shim that nobody noticed had drifted. The preview now reads the gateway-configured model directly, so the line above the new nudge is finally truthful.
+
+### How to use it
+
+For a fresh gstack per-worktree code brain:
+
+```bash
+export GBRAIN_HOME=/path/to/worktree/.conductor/gbrain
+gbrain init --pglite \
+  --embedding-model voyage:voyage-code-3 \
+  --embedding-dimensions 1024
+```
+
+For an already-initialized brain:
+
+```bash
+gbrain config set embedding_model voyage:voyage-code-3
+gbrain config set embedding_dimensions 1024
+gbrain reindex --code --yes
+```
+
+To stay on a non-code-tuned model and silence the nudge:
+
+```bash
+export GBRAIN_NO_CODE_MODEL_NUDGE=1
+```
+
+### Itemized changes
+
+- `src/commands/reindex-code.ts` — new exported `shouldNudgeCodeModel(bareModelName)` pure helper returning a tagged `NudgeDecision` union. Wired into `runReindexCode` (not the CLI wrapper) so dry-run AND execute paths both surface the nudge — codex outside-voice caught that the CLI wrapper's `--dry-run` branch returns before its gate block, which is where the original plan placed the nudge. Allowlist of code-tuned bare model names: `new Set(['voyage-code-3'])` (case-insensitive); the helper takes the bare name that `getEmbeddingModelName()` actually returns (gateway strips the provider prefix) and emits the qualified `voyage:voyage-code-3` for the paste-ready `gbrain config set` line. Three suppression gates: `opts.json`, `opts.noEmbed`, `process.env.GBRAIN_NO_CODE_MODEL_NUDGE === '1'`. Same file: cost-preview model field swapped from the hardcoded `EMBEDDING_MODEL` back-compat shim at `src/core/embedding.ts:126` to `getEmbeddingModelName()` at all five usage sites (was producing a directly-contradictory model name next to the nudge).
+- `docs/integrations/embedding-providers.md` — "Code-heavy brain (gstack per-worktree, source repos)" branch added to the Decision tree; Voyage section gains a dedicated `voyage-code-3` paragraph linking to voyageai.com/blog for head-to-head numbers (vendor claims softened per codex review).
+- `docs/architecture/topologies.md` — Topology 3 gets a "Recommended embedding model" subsection between "How it works" and "CRITICAL: alias-level routing is manual". Uses `gbrain init --embedding-model` one-shot to avoid the `config set` + `init` ordering ambiguity codex caught.
+- `skills/setup/SKILL.md` — Topology 3 option in the deployment-shape picker grows a one-liner pointing at voyage-code-3 + the topology doc for the full setup recipe.
+- `test/ai/voyage-code-3-recipe.test.ts` — new regression pin: voyage-code-3 in the recipe `models[]` list, in `VOYAGE_OUTPUT_DIMENSION_MODELS`, accepted by `supportsVoyageOutputDimension`, and routed through `dimsProviderOptions` on the SDK-supported `dimensions` field (not the wire-key `output_dimension` — that's the v0.33.1.0 bug class).
+- `test/reindex-code-nudge.serial.test.ts` — new test, serial: 6 pure-function cases over `shouldNudgeCodeModel` (text-embedding-3-large fires, text-embedding-3-small fires, voyage-4-large fires, voyage-code-3 doesn't, Voyage-Code-3 case-insensitive doesn't, empty/null/undefined/whitespace doesn't) + 5 CLI integration cases pinning the suppression contract (default fires on stderr not stdout, `--no-embed` suppresses, `--json` suppresses, `GBRAIN_NO_CODE_MODEL_NUDGE=1` suppresses, already-optimal voyage-code-3 no-ops).
+- `test/reindex-code-model-source.serial.test.ts` — new IRON-RULE regression test pinning the cost-preview correctness fix: `runReindexCode({dryRun: true}).model` equals the gateway-configured embedding model name (voyage-code-3, text-embedding-3-small, voyage-4-large round-trip), NOT the legacy hardcoded `'text-embedding-3-large'` constant.
+- `test/reindex-code.test.ts` — updated: now configures the gateway with `openai:text-embedding-3-large` in `beforeAll` (`getEmbeddingModelName()` requires gateway state; the existing model-name assertion at `:80` still passes verbatim) and sets `GBRAIN_NO_CODE_MODEL_NUDGE=1` so test stderr stays clean.
+- `CLAUDE.md` — new Key Files entry for `src/commands/reindex-code.ts`; Voyage recipe entry annotated with the v0.37.8.0 discoverability surfaces.
+
+## [0.37.7.0] - 2026-05-21
+
+**Your federated brain stops silently writing to the wrong source. Your autopilot stops thrashing when you point it at a second brain. A handful of CLI surfaces that crashed on first call stop crashing.**
+
+If you've ever run gbrain with more than one source (an Obsidian vault + a docs repo, a CEO with multiple team sub-brains), you've probably noticed that `gbrain import --source dept-x` silently writes to `default` instead. Or that `gbrain extract` produces zero links on a federated brain. Or that `gbrain doctor` recommends a command that can't actually fix it. This release wires every CLI surface through the same source-resolver that `gbrain serve` has used since v0.18.0, and adds a doctor check that catches the silent-collapse-to-default class.
+
+Plus: autopilot lockfile finally respects `GBRAIN_HOME` so two brains can coexist. The reconnect loop that logged `config.database_url undefined` forever now exits cleanly and lets launchd back off. `gbrain reindex-frontmatter` no longer crashes before doing anything. OAuth `authorization_code` confidential clients work again. And we caught a dead-letter bug where successful subagent jobs were being marked failed because the worker tried to re-prompt past an `end_turn`.
+
+### What landed
+
+| Piece | What it fixes / adds | How to use it |
+|---|---|---|
+| **`gbrain import --source-id <id>`** (#1167) | `import` finally honors the source flag — pages route to the named source instead of silently collapsing to `default` | `gbrain import path/ --source-id dept-x` |
+| **`gbrain extract --source-id <id>`** (#1204) | Same fix for extract — link + timeline extraction now scopes to one source on federated brains | `gbrain extract all --source-id dept-x` |
+| **`gbrain sources current`** (#1222) | New subcommand that prints the resolved source + the tier that won (flag / env / dotfile / local_path / brain_default / seed_default) | `gbrain sources current --json` |
+| **`gbrain graph-query --include-foreign`** (#1153) | Cross-source edges no longer disappear silently. Footer shows foreign-edge count by default; `--include-foreign` walks them | `gbrain graph-query alice --depth 2 --include-foreign` |
+| **`skills/conventions/brain-routing.md`** (#1222) | Documents the canonical 6-tier source resolution chain so agents stop guessing | Read it; pointed at from CLAUDE.md |
+| **Autopilot lockfile scoped to `GBRAIN_HOME`** (#1226) | Two brains can run autopilot simultaneously without one stealing the other's lock | Set `GBRAIN_HOME=/path/to/brain-b gbrain autopilot --install` |
+| **Autopilot reconnect classifier + launchd ThrottleInterval** (#1162) | Reconnect loop that logged `config.database_url undefined` every 5s now exits cleanly. New launchd plist sets `ThrottleInterval=300` so launchd respects unrecoverable failures | `gbrain autopilot --install` regenerates the plist |
+| **OAuth confidential `authorization_code` clients** (#1166) | The MCP SDK's `clientAuth` middleware does plaintext compare; gbrain stores SHA-256 hashes, so confidential clients failed every `/token` request. Custom verifier middleware now runs before the SDK | `gbrain auth register-client --grant-types authorization_code` works again |
+| **`gbrain reindex-frontmatter`** (#1225) | Crashed on first call because it queried the engine before connecting it. Now connects via the existing command pattern | `gbrain reindex-frontmatter` |
+| **Subagent terminal-on-resume** (#1151) | Successful subagent jobs were being marked failed because the worker tried to re-prompt past an `end_turn` on resume. Short-circuits to terminal | Automatic on next worker restart |
+| **Sync walker skips git submodules** (#1169) | `pruneDir()` now detects submodules (`.git` as a file, not a directory) and stops walking into them. Stops phantom imports of submodule content | Automatic |
+| **3 new doctor checks** (T12/T13/T14) | `source_routing_health` (catches silent-collapse-to-default on federated brains), `oauth_confidential_health` (probes confidential-client `/token` reachability), `autopilot_lock_scope` (warns when lock isn't under `GBRAIN_HOME`) | `gbrain doctor` |
+
+### How to verify the source-routing fix
+
+```bash
+# Show which source resolved + why
+gbrain sources current
+
+# JSON shape for scripting
+gbrain sources current --json
+# → {"source_id":"dept-x","tier":"dotfile","detail":".gbrain-source"}
+
+# Doctor check — should be ok on a properly federated brain
+gbrain doctor --json | jq '.checks[] | select(.name=="source_routing_health")'
+```
+
+The 6-tier chain documented in `skills/conventions/brain-routing.md`:
+
+1. `--source <id>` flag (explicit, always wins)
+2. `GBRAIN_SOURCE` env var
+3. `.gbrain-source` dotfile walk-up
+4. Registered source whose `local_path` contains CWD
+5. Brain default (config key)
+6. Seed default (`default`)
+
+### What's safe to know about
+
+- **Default behavior unchanged for single-source brains.** If you only have `default`, nothing in this release changes how your commands route. The fixes only fire on federated brains (`gbrain sources list` shows more than one row).
+- **Autopilot lockfile path changed.** Old: `~/.gbrain/autopilot.lock` only. New: `$GBRAIN_HOME/autopilot.lock` (defaults to `~/.gbrain` when unset, so most users see no path change). The doctor check warns if your `GBRAIN_HOME` is set but the lock landed in the wrong place.
+- **`reindex-frontmatter`'s fix is two lines but it's load-bearing.** Pre-fix the command would `process.exit(1)` with a TypeError on first call. Post-fix it does what it always claimed to.
+- **OAuth confidential clients were dead in v0.37.0–v0.37.6.** If your agent (Hermes, custom orchestrator) uses `authorization_code` + `client_secret_post` against gbrain, you needed this. Public PKCE clients (Claude Code, Cursor) were unaffected — they don't present a secret.
+- **The 3 new doctor checks are warn-only.** None fail the doctor exit. They surface paste-ready fix hints inline.
+
+### What we caught and fixed before merging
+
+- **Lockfile PID-safety.** The first-pass autopilot-lock fix moved the lock path but kept the existence-only check. Codex caught that a stale lock from a crashed process would block a healthy autopilot from starting. The shipped version writes PID into the lock and checks `kill -0 <pid>` before refusing to start.
+- **OAuth confidential auth detection.** The first-pass middleware sniffed for `Authorization: Basic` headers only. That missed `client_secret_post` (form-encoded body) which is the more common shape. The shipped version handles both.
+- **`pruneDir` submodule detection.** The first-pass used `existsSync(.git)` which is true for both regular repos AND submodules. Refined to `statSync(.git).isFile()` — submodule gitfiles are FILES pointing into the parent's `.git/modules/`, regular repos have `.git` as a DIRECTORY.
+- **`resolveSourceWithTier()` is additive.** Original plan refactored `resolveSourceId()` to return the tier. Codex pointed out that breaks every existing caller. Shipped as a new function alongside the old one; the existing 6-tier chain is unchanged.
+
+### Itemized changes
+
+#### CLI surfaces (production code)
+
+- `src/commands/import.ts` — new `--source-id <id>` flag. Resolved via `resolveSourceWithTier()` before any page write; failures surface with paste-ready `gbrain sources list` hint. Closes #1167.
+- `src/commands/extract.ts` — same `--source-id` flag, threaded through `extractLinks()` / `extractTimeline()` so SQL scopes to the named source. Closes #1204.
+- `src/commands/sources.ts` — new `gbrain sources current [--json]` subcommand. Calls `resolveSourceWithTier()` and prints `source_id`, `tier`, optional `detail`. Closes #1222.
+- `src/commands/graph-query.ts` — foreign-edge footer always present (`X foreign edges (use --include-foreign to traverse)`). `--include-foreign` flag widens the SQL filter to cross-source edges. Closes #1153.
+- `src/commands/reindex-frontmatter.ts` — wrapped query path in the standard `withEngine(...)` lifecycle so `engine.connect()` runs before the first SQL call. Closes #1225.
+- `src/commands/autopilot.ts` — `LOCK_PATH` now resolves via `gbrainPath('autopilot.lock')` (honors `GBRAIN_HOME`). New exports `classifyReconnectError(err)` (returns `'recoverable' | 'unrecoverable'`; unrecoverable causes the daemon to `process.exit(0)` and let launchd back off) and `generateLaunchdPlist(wrapperPath, home)` (pure plist string for tests). Lock file now stores PID; startup checks `kill -0 <pid>` before refusing. Closes #1162 + #1226.
+- `src/core/oauth-provider.ts` + `src/commands/serve-http.ts` — custom `/token` middleware that runs BEFORE the MCP SDK's `clientAuth`. Detects confidential auth via `Authorization: Basic` header OR `client_secret_post` form body; verifies via SHA-256 hash compare and falls through to the SDK for public PKCE clients. Closes #1166.
+- `src/core/sync.ts` — `pruneDir(name, parentDir?)` extended with optional `parentDir`; when provided, additionally rejects directories containing `.git` as a FILE (git submodule gitfile pattern). Sync + extract walkers thread `parentDir` through. Closes #1169.
+- `src/core/minions/handlers/subagent.ts` — terminal-state short-circuit on resume. When a stored message thread already ends in `stop_reason: 'end_turn'`, the handler returns `{ ok: true }` instead of issuing another `messages.create` call (which would have failed and dead-lettered a successful job). Closes #1151.
+
+#### New helpers (production code)
+
+- `src/core/source-resolver.ts` — additive `resolveSourceWithTier(engine, explicit, cwd)` returns `{ source_id, tier, detail? }`. New exported const `SOURCE_TIER_NAMES = ['flag', 'env', 'dotfile', 'local_path', 'brain_default', 'seed_default']` so the JSON shape is type-stable across releases. The existing `resolveSourceId()` is unchanged.
+
+#### Doctor checks (production code)
+
+- `src/commands/doctor.ts` — three new checks wired into both `runDoctor()` and the JSON envelope:
+  - `checkSourceRoutingHealth(engine)` — scans up to 200 pages on federated brains, flags pages whose `source_id` doesn't match what `resolveSourceWithTier()` would have picked for their `source_path`. Short-circuits to `ok` for single-source brains.
+  - `checkOauthConfidentialHealth(engine)` — probes registered confidential clients for `/token` reachability; warns when the v0.37.0–v0.37.6 plaintext-compare bug class would have rejected them.
+  - `checkAutopilotLockScope()` — pure function check (no engine). Compares the resolved lock path to `$GBRAIN_HOME`; warns when `$GBRAIN_HOME` is set but the lock lives elsewhere, with a PID-safe hint to inspect the lock file before deleting it.
+
+#### Documentation
+
+- `skills/conventions/brain-routing.md` — new convention skill documenting the 6-tier source resolution chain with paste-ready agent decision table. Linked from CLAUDE.md's "Two organizational axes" section. Closes #1222.
+
+#### Tests
+
+- `test/source-resolver-with-tier.test.ts` — 6-tier resolution chain coverage (each tier's win condition, precedence ordering, invalid-source rejection, detail strings). Uses `withEnv()` wrapper for env-mutation isolation per the test-isolation lint.
+- `test/import-source-id.test.ts` — `--source-id` flag round-trip + error path.
+- `test/graph-query.test.ts` — foreign-edge footer + `--include-foreign` traversal.
+- `test/oauth-confidential-client.test.ts` — `client_secret_basic` + `client_secret_post` paths against the custom middleware.
+- `test/autopilot-lock-path.test.ts` — `GBRAIN_HOME` scope + PID-safe staleness detection.
+- `test/autopilot-reconnect-classifier.test.ts` — recoverable vs unrecoverable error classification + plist generator shape.
+- `test/sync-walker-submodule.test.ts` — submodule detection via gitfile-as-FILE.
+- `test/subagent-handler.test.ts` — terminal-on-resume short-circuit.
+- `test/reindex-frontmatter-connect.test.ts` — engine.connect() runs before first query.
+- `test/doctor-v0_37_7_checks.test.ts` — all 3 new doctor checks against fixture brains (single-source ok-fast-path, federated brain mismatch warn, OAuth confidential warn shape, lock-scope mismatch warn).
+
+#### Closed community PRs
+
+Credited contributors per the CHANGELOG attribution convention; closing comments point at the absorbed commits.
+
+## To take advantage of v0.37.7.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if
+`gbrain doctor` warns about anything new:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Try the capture verb:**
+   ```bash
+   gbrain capture "first thought into v0.38"
+   gbrain query "first thought"
+   ```
+   The receipt block should show the slug + file path; the query should
+   return the page within a second.
+3. **For webhook ingestion** (only if you run `gbrain serve --http`):
+   ```bash
+   curl -X POST https://your-brain/ingest \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: text/markdown" \
+     -d "# webhook test"
+   ```
+   You should see HTTP 202 + a `job_id`. Run `gbrain query "webhook test"`
+   to confirm the page landed.
+4. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+   This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
+2. **Verify the source-routing fix on your federated brains:**
+   ```bash
+   gbrain sources current
+   gbrain doctor --json | jq '.checks[] | select(.name=="source_routing_health")'
+   ```
+3. **If autopilot was thrashing on a second-brain install,** check
+   the new lockfile path:
+   ```bash
+   ls -la ~/.gbrain/autopilot.lock $GBRAIN_HOME/autopilot.lock 2>/dev/null
+   ```
+4. **If any step fails,** file an issue at
+   https://github.com/garrytan/gbrain/issues with `gbrain doctor`
+   output + contents of `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+## [0.37.6.0] - 2026-05-20
+
+**One key, many hosted models.**
+
+You can now configure `openrouter:<provider>/<model>` directly in gbrain. OpenRouter proxies OpenAI, Anthropic, Google, DeepSeek, Meta, Qwen, and dozens of other hosted models through one OpenAI-compatible endpoint with one API key. Instead of juggling per-provider keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, DEEPSEEK_API_KEY, etc.), you set `OPENROUTER_API_KEY` once and pick the model at call time. Embedding goes through too, defaulting to `openai/text-embedding-3-small` with Matryoshka shrink to 512/768/1024.
+
+OpenRouter shows up in `gbrain providers list` as the 16th recipe (alphabetical between Ollama and OpenAI). Your traffic gets attributed to gbrain on OR's leaderboard via `HTTP-Referer` + `X-OpenRouter-Title` headers; if you're running gbrain inside a different agent stack (a downstream agent, your own fork, anything else) set `OPENROUTER_REFERER` + `OPENROUTER_TITLE` so your traffic gets attributed to you instead.
+
+**How to turn it on**
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+gbrain providers list | grep -i openrouter           # see the new recipe
+gbrain providers env openrouter                      # see all OR-related env vars
+gbrain config set chat_model openrouter:anthropic/claude-sonnet-4.6
+gbrain config set embedding_model openrouter:openai/text-embedding-3-small
+gbrain config set embedding_dimensions 1024          # Matryoshka, optional
+```
+
+For forks attributing their own traffic:
+
+```bash
+export OPENROUTER_REFERER=https://your-app.example
+export OPENROUTER_TITLE="Your App"
+```
+
+**A few sharp edges to know about**
+
+- **Subagent loops stay Anthropic-direct.** gbrain's subagent infrastructure (the long tool-calling loop that powers `gbrain agent run`) is hard-pinned to Anthropic-direct because crash-replay needs stable `tool_use_id` blocks across attempts and OR's response normalization doesn't guarantee that. `openrouter:anthropic/claude-haiku-4.5` works fine for chat; it gets rejected at subagent submit time. Keep an Anthropic key if you use `gbrain agent`.
+- **Per-model context limits vary.** The OR catalog spans 128K to 1M+ context windows. The recipe declares no recipe-wide `max_context_tokens` — upstream errors surface per-model.
+- **Catalog churns.** The 8 curated chat slugs in the recipe (gpt-5.2, gpt-5.5, claude-haiku-4.5, claude-sonnet-4.6, claude-opus-4.7, gemini-3-flash-preview, deepseek-chat) are starting points, not a closed enum. Pass any OR model ID and it routes through; check https://openrouter.ai/models for the live catalog.
+
+**Under the hood — `default_headers` seam on Recipe**
+
+To ship attribution headers cleanly, this release adds a generic `Recipe.default_headers` (static) and `Recipe.resolveDefaultHeaders?(env)` (env-templated) seam. Headers from these fields ride alongside the existing Bearer auth on every openai-compatible touchpoint (embedding, expansion, chat, reranker). Two guards fire at `applyResolveAuth` time: declaring both fields throws `AIConfigError` (mutual exclusion); a default header that would shadow the auth header (`Authorization`, or any custom-header recipe's auth key) also throws. Together/Groq/any future recipe can opt into the same seam in a follow-up.
+
+The reranker HTTP path at `gateway.ts:2281` now merges both `Authorization: Bearer <key>` AND `auth.headers` (where default_headers flow) into the request's Headers map. Pre-fix the ternary picked one or the other; default_headers would have been silently dropped on the manual rerank path.
+
+**What's tested**
+
+Four new test files prove the seam reaches the wire, not just the return shape:
+
+- `test/ai/recipe-openrouter.test.ts` — 11 cases: recipe shape, Matryoshka `dims_options: [512, 768, 1024, 1536]`, `max_batch_tokens: 300_000` (OpenAI aggregate per-request cap, not per-input), arbitrary-ID acceptance, `resolveDefaultHeaders` defaults + env override, setup_hint coverage.
+- `test/ai/header-transport.test.ts` — 3 cases: synthetic recipes with custom `fetch` wrappers capture outgoing headers on `embed()`, `chat()`, and `rerank()`. Asserts Authorization + HTTP-Referer + X-OpenRouter-Title + X-Title all reach the wire.
+- `test/ai/recipes-existing-regression.test.ts` — IRON RULE preserved + 6 new contract cases for the `default_headers`/`resolveDefaultHeaders` merge and both safety guards.
+- `test/ai/build-gateway-config.test.ts` — 7 cases pinning the 5-way env-baseURL passthrough (LLAMA_SERVER, OLLAMA, LMSTUDIO, LITELLM, OPENROUTER) through the now-exported `buildGatewayConfig`. Mops up pre-existing untested drift on four legacy env vars in the same pass.
+
+Cherry-picked from [#1210](https://github.com/garrytan/gbrain/pull/1210). Contributed by @davemorin; corrections from an outside-voice review (Codex) folded in: recipe count math (16 not 17), current OR attribution header name (`X-OpenRouter-Title` preferred, `X-Title` back-compat), `max_batch_tokens` semantic (aggregate not per-input), Matryoshka dims for `text-embedding-3-small`, and the auth-shadow guard at `applyResolveAuth`.
+
+## To take advantage of v0.37.6.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if you want to verify the recipe shipped:
+
+1. **Check the recipe is registered:**
+   ```bash
+   gbrain providers list | grep -i openrouter
+   ```
+2. **Check env-var reporting:**
+   ```bash
+   OPENROUTER_API_KEY=fake-test gbrain providers env openrouter
+   ```
+   Should list `OPENROUTER_API_KEY` (required), `OPENROUTER_BASE_URL`, `OPENROUTER_REFERER`, `OPENROUTER_TITLE` (optional).
+3. **Smoke-test embeddings against a real key:**
+   ```bash
+   export OPENROUTER_API_KEY=sk-or-...
+   gbrain providers test --model openrouter:openai/text-embedding-3-small
+   ```
+4. **If any step fails,** file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor`.
+
+## [0.37.5.0] - 2026-05-20
+
+**`gbrain doctor` stops flagging your tags as broken when they're not.**
+
+If you have a tag line like `tags: ["yc", "w2025", "ai"]` in your frontmatter, that's perfectly valid YAML. The doctor used to flag it anyway. One user with a 105K-page brain saw 6,981 of these flagged at once. The fix: the validator now parses suspicious values with a real YAML parser before complaining. Valid YAML stops getting flagged. Genuinely broken titles like `title: "Foo "bar" baz"` still get caught.
+
+**How to use it**
+
+```bash
+gbrain upgrade
+gbrain doctor --json | jq '.checks[]
+  | select(.name=="frontmatter_integrity")
+  | .breakdown.NESTED_QUOTES'
+```
+
+The NESTED_QUOTES count on your brain should drop toward zero on next `gbrain doctor`. No data rewrite needed. No `gbrain frontmatter generate --fix` sweep. The existing files are already valid YAML.
+
+**Why this is the right layer**
+
+`@garrytan-agents` opened PR #1217 with a one-line fix to the emitter side: switch tag serialization from `JSON.stringify` (double-quoted) to single-quoted YAML. That made the headline 6,981-error case go away by changing what new writes look like. But Codex's outside-voice review during planning caught a deeper bug: even with a perfect emitter, the validator at `src/core/markdown.ts:219-238` was a raw quote counter (`count(unescaped ")  >= 3 => error`) that doesn't understand YAML at all. It would still flag a clean single-quoted scalar like `title: 'a: "b" "c"'` (6 unescaped `"` characters, but valid YAML). The fix had to land on the dumb side, not the emitter side.
+
+PR #1217 was closed; thanks to @garrytan-agents for the 6,981-error signal that exposed the underlying class.
+
+**What's safe to know about**
+
+- The fix is additive. Lines with `< 3` unescaped quotes still pass instantly (existing fast path). Only suspicious lines pay the per-line YAML parse, and only when count >= 3 (rare on healthy data).
+- `js-yaml@3.14.2` is now a direct dependency (was transitive via gray-matter). Adding a direct pin so a future gray-matter major bump can't yank the import.
+- The frontmatter emitter at `src/core/frontmatter-inference.ts` is unchanged. Existing tag style (`tags: ["yc"]`) is now correctly recognized as valid; the cosmetic consistency with `brain-writer.ts:184`'s single-quote repair style is a follow-up TODO, not part of this fix.
+
+### Itemized changes
+
+#### Fixed
+
+- `src/core/markdown.ts:219-238` — NESTED_QUOTES validator now disambiguates via `js-yaml.safeLoad`. The count-of-quotes heuristic stays as a fast path; suspicious lines (count >= 3) are parsed before being flagged. Closes the 6,981-error class for any brain whose frontmatter has been valid all along.
+- `js-yaml` declared as a direct dependency in `package.json`; `@types/js-yaml` added to devDependencies. `bun.lock` re-resolves the transitive entry to a top-level pin (no version change).
+
+#### Added
+
+- 5 new YAML-aware regression cases in `test/markdown-validation.test.ts`:
+  - flow sequence with quoted tags does NOT trigger (6,981-error regression guard)
+  - single-quoted scalar with literal inner double quotes does NOT trigger
+  - escaped-as-`''` quotes inside flow seq do NOT trigger
+  - genuinely broken nested quotes STILL trigger
+  - unclosed bracket STILL surfaces NESTED_QUOTES or YAML_PARSE (never silent)
+
+#### For contributors
+
+- `js-yaml` is now an explicit direct dep. New code that needs YAML emission/parsing should import from it directly rather than relying on gray-matter's transitive resolution.
+## [0.37.4.0] - 2026-05-20
+
+**A nightly safety net for the bug class that bit gbrain 10 times in 2 years.**
+**Plus a graph cap so a hub person with 500 connections can't make `traverseGraph` blow up.**
+
+The 10+ forward-reference bugs documented in CLAUDE.md (#239 / #243 / #266 / #357 / #366 / #374 / #375 / #378 / #395 / #396) all shipped the same way: a new release added a column to the schema blob, an old user's brain didn't have that column, and `gbrain upgrade` wedged on `column "..." does not exist`. We always caught these in production. This release ports a CI pattern from pgGraph (a sibling pgrx extension) that catches the next member of that bug class before users hit it — by walking a simulated-legacy brain forward to head on every nightly CI run, against real Postgres.
+
+The same wave adds an opt-in cap on `traverseGraph` for hub-fanout protection, a property-based fuzz harness for the trust-boundary validators, and a memory budget gate that probes peak RSS during a synthetic workload. None of it changes default behavior; everything that touches production code is back-compat.
+
+### What landed
+
+| Piece | What it catches | How it runs |
+|---|---|---|
+| **Schema-migration matrix** | Walk-forward wedges from any historical brain shape (pre-v0.13 + pre-v0.18 seeded; extensible to any earlier shape) | `bash tests/heavy/pg_upgrade_matrix.sh` — Postgres-only, ~4s for both shapes |
+| **Fuzz harness for trust-boundary validators** | Edge-case crashes in `validatePageSlug`, `validateFilename`, `escapeLikePattern`, `parseFactsFence`, plus property tests for `splitBody`, `slugifyPath`, `sanitizeQueryForPrompt`, `validateUploadPath` | `bun test test/fuzz/` (runs in default `bun test`, ~3s for 1000 inputs × 8 properties) |
+| **RSS budget gate** | Peak RSS regressions over a 200-page synthetic workload, baseline-vs-now delta | `bash tests/heavy/measure_rss.sh` — Linux-only baseline refresh, informational on macOS |
+| **Read-latency-under-sync** | Search p99 degradation while writes hammer the engine | `bash tests/heavy/read_latency_under_sync.sh` |
+| **Sync lock regression** | One winner + N-1 lock-busy + zero leaked `gbrain_cycle_locks` rows under concurrent `gbrain sync` (real semantics — losers fail fast, they don't queue) | `bash tests/heavy/sync_lock_regression.sh` — Postgres-only |
+| **`tests/heavy/` convention** | Home for ops-shape scripts that don't fit `*.slow.test.ts` (per-file unit-shape) | `bun run test:heavy` runs the directory sequentially |
+| **Nightly + opt-in CI workflow** | Runs the whole heavy suite at 08:17 UTC daily AND on any PR tagged `heavy-tests`, with Postgres service + artifact upload on failure | `.github/workflows/heavy-tests.yml` |
+| **BFS frontier cap on `traverseGraph`** | Hub-person fan-out blowing up at depth ≥ 2 (back-compat opt-in via new `frontierCap` knob) | `engine.traverseGraph(slug, depth, { frontierCap: 500 })` |
+
+### How to turn it on
+
+The heavy suite is opt-in. To run locally:
+
+```bash
+# Spin up Postgres for the Postgres-only tests:
+docker run -d --name gbrain-test-pg \
+  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=gbrain_test -p 5434:5432 pgvector/pgvector:pg16
+export DATABASE_URL=postgresql://postgres:postgres@localhost:5434/gbrain_test
+bun run test:heavy
+```
+
+For the frontier cap, opt in per call:
+
+```ts
+const nodes = await engine.traverseGraph('alice', 3, { frontierCap: 500 });
+// nodes.length is bounded — that's the protection. A truncation-signal
+// callback was designed but stripped pre-merge; see "what's safe to know"
+// below for the deferral.
+```
+
+### What's safe to know about
+
+- **Default behavior unchanged.** No call to `traverseGraph` sees different results unless they pass `frontierCap`. The `traverse_graph` MCP wire shape (Array of nodes, not a struct) is preserved — external clients keep working.
+- **`onTruncation` callback stripped pre-merge.** The original plan called for a callback that fired when the cap dropped nodes. /review caught two bugs in the v1 algorithm: false positives when a graph organically has exactly `cap` unique nodes at some depth, and false negatives in diamond graphs because the recursive `LIMIT N` ran before the outer `SELECT DISTINCT`. Rather than ship a signal callers couldn't trust, we cut it. The cap itself (the actually-useful frontier protection) ships clean; the signal returns in a follow-up wave once a dedupe-then-cap SQL rewrite + Postgres parity E2E land. Tracked in TODOS.md → "T8 truncation signal".
+- **`tests/heavy/` isn't in `bun test`.** The runner stays fast (8 shards, ~6 minutes). The heavy stuff runs nightly or on label.
+- **RSS baseline is empty on first commit.** The first Linux CI nightly populates it via `tests/heavy/measure_rss.sh --refresh-baseline`. Until then every measurement is informational. The macOS fallback path is `process.memoryUsage().rss` (VmRSS, mmap-inflated) — the gate refuses to write a baseline from a macOS run by design.
+- **Fuzz purity is bundle-verified.** `scripts/check-fuzz-purity.sh` runs in `verify`. It bundles each pure-target file via `bun build --target=bun` and greps for `node:fs` / `node:child_process` / engine imports. Source-grep can be fooled by transitive imports; the bundle can't.
+
+### What we caught and fixed before merging
+
+Three review passes ran on the plan before any code: a CEO scope review (Approach C, full sweep, 9 tasks), an Eng dual-voice review (Claude subagent + Codex), and a Codex 2nd-pass verifier against the revised plan. The 2nd pass caught issues the first two missed:
+
+- The fuzz purity guard's `require.cache` snapshot would have been theatrical under Bun's ESM loader. Swapped to bun-bundle-then-grep, which catches transitive impurity. Five proposed pure targets turned out to transitively import `fs` (validator-shaped functions living in modules that pull in helpers that import fs); they moved to `mixed-validators.test.ts` with property tests but no purity guarantee. Only `escapeLikePattern` and `parseFactsFence` are bundle-pure.
+- The first-pass T8 design stored truncation metadata on the engine instance. Concurrent traversals would have stomped each other's metadata. Switched to a per-call `onTruncation` callback — each call's closure is independent.
+- The first-pass T3 design proposed committing a 50K-page PGLite fixture to the repo. Repo-size risk + contradicted T1's no-blobs principle. Switched to in-process synthesis (200 pages by default; configurable up).
+- Three reviewers caught the original `LIMIT N PARTITION BY depth` SQL as not-actually-valid syntax. Real shape is parenthesized `LIMIT N ORDER BY (slug, id)` inside the recursive term, with `DISTINCT ON` post-dedupe.
+
+### Itemized changes
+
+#### Engine (production code)
+
+- `src/core/engine.ts` — new export `TraverseGraphOpts`. `traverseGraph(slug, depth, opts?)` opts widen to include `frontierCap?: number`. Return type unchanged (`Promise<GraphNode[]>`).
+- `src/core/postgres-engine.ts` — recursive CTE in `traverseGraph` adds parenthesized `LIMIT N ORDER BY p2.slug ASC, p2.id ASC` inside the recursive term when `frontierCap` is set.
+- `src/core/pglite-engine.ts` — same shape, same SQL, positional params.
+
+#### Heavy tests (new directory)
+
+- `tests/heavy/pg_upgrade_matrix.sh` + `tests/heavy/_build_legacy_fixtures.sh` + `tests/heavy/fixtures/down-mutate-pre-v0.13.sql` + `tests/heavy/fixtures/down-mutate-pre-v0.18.sql` — schema-migration walk-forward matrix.
+- `tests/heavy/measure_rss.sh` + `tests/heavy/_measure_rss_workload.ts` + `tests/heavy/rss-baseline.json` — RSS budget gate, informational-only until Linux baseline lands.
+- `tests/heavy/read_latency_under_sync.sh` + `tests/heavy/_read_latency_workload.ts` — search p50/p95/p99 baseline vs under-load.
+- `tests/heavy/sync_lock_regression.sh` — concurrent `gbrain sync` lock contention.
+- `tests/heavy/README.md` + `scripts/run-heavy.sh` + `bun run test:heavy` script — convention + runner. Underscore-prefix files (`_foo.sh`) are helpers skipped by the runner.
+
+#### Fuzz harness (new)
+
+- `test/fuzz/pure-validators.test.ts` — purity-guarded: `escapeLikePattern`, `parseFactsFence`.
+- `test/fuzz/mixed-validators.test.ts` — same property tests, no purity guarantee: `validatePageSlug`, `validateFilename`, `splitBody`, `slugifyPath`, `sanitizeQueryForPrompt`.
+- `test/fuzz/filesystem-validators.test.ts` — fs-backed property tests with temp dirs: `validateUploadPath` (symlink-escape, traversal probe, arbitrary input).
+- `test/fuzz/regressions/README.md` — pin-failed-fuzz-inputs convention.
+- `scripts/check-fuzz-purity.sh` — bun-bundle + grep for banned imports. Wired into `bun run verify`.
+
+#### CI workflow (new)
+
+- `.github/workflows/heavy-tests.yml` — `cron: '17 8 * * *'` + `pull_request: types: [labeled]` with `heavy-tests` filter + `workflow_dispatch`. Postgres service + pinned action SHAs + artifact upload on failure (uploads `~/.gbrain/audit/heavy-*` + `tests/heavy/rss-baseline.json`).
+
+#### Tests + docs
+
+- `test/regressions/v0_36_frontier_cap.test.ts` — 4 pinned contracts: cap-unset back-compat, cap-hit bounds result to `<= cap+1` (the actually-useful protection invariant), MCP wire-shape preservation (still Array), concurrency independence (two concurrent calls on same engine with different caps — larger cap sees >= as many nodes).
+- `CLAUDE.md` — file taxonomy gains `tests/heavy/*.sh` + `test/fuzz/*.test.ts` entries; `traverseGraph` entry notes the new opt + the stripped truncation callback.
+- `llms-full.txt` regenerated.
+## [0.37.3.0] - 2026-05-19
+
+**Your agent now catches skills that would call the web before checking the brain. The same class of miss that flagged Garry's own Palantir tweet as a risk because none of the three eval models knew he built it.**
+
+Real story: on 2026-05-19, the cross-modal eval looked at a tweet about Palantir's Finance UI and said "this is risky, none of us recognize this work." But Garry's brain already had pages explaining he designed that Finance UI and shipped 150+ PSDs in 2006. The brain knew. The eval skill went to the web first and never asked the brain. A static SKILL.md check catches the authorship side of that failure mode: any skill that calls `web_search`, Perplexity, Exa, Crustdata, Happenstance, or Captain API now has to declare either how it consults the brain first, or that it intentionally doesn't need to.
+
+How to turn it on (it's already on after upgrade):
+
+```
+gbrain doctor                 # warns on skills that need brain-first declaration
+gbrain doctor --fix           # auto-adds the canonical Convention callout to each
+gbrain doctor --fix --dry-run # preview without writing
+```
+
+What a flagged skill looks like in your `~/.openclaw/workspace/skills/`:
+
+| Skill | What the doctor sees | Easy fix |
+|---|---|---|
+| Author called `perplexity` for research but never `gbrain search` | warn — `missing_brain_first` | `gbrain doctor --fix` adds `> **Convention:** see [conventions/brain-first.md](...)` near the top |
+| Pure infra (cron schedulers, container managers, ask-user prompters) | warn — same | Add `brain_first: exempt` to frontmatter; that's it |
+| Author typed `brain-first: exempt` (kebab-case typo) | warn + paste-ready hint | Switch to snake_case `brain_first: exempt` |
+| Already carries `> **Convention:** see conventions/brain-first.md` | ok — `compliant_callout` | no action |
+| First `gbrain search` reference comes before first `web_search` in body | ok — `compliant_position` | no action |
+
+The cathedral piece that makes this stick: `gbrain doctor --fix` runs through the same git-safety gates that `dry-fix.ts` already shipped (refuses to write to a dirty working tree, refuses on non-git files, refuses against the install-tree fallback). So you can run `--fix` on your OpenClaw workspace without losing the audit trail.
+
+Things to watch:
+- Audit log lives at `~/.gbrain/audit/skill-brain-first-YYYY-Www.jsonl` (ISO-week rotated). Stable brains write zero lines per doctor run; only state transitions (new violation, resolved violation, applied fix) get recorded. So `tail -20` actually shows you signal, not noise.
+- The snapshot at `~/.gbrain/audit/skill-brain-first-snapshot.json` is last-writer-wins under concurrent doctor runs. If two doctor processes race, one snapshot wins; the next run reconciles.
+- New skills scaffolded via `gbrain skillify scaffold <name>` get the canonical Convention callout pre-inserted. `gbrain skillify check <skill>` fails (exit 1) when external-lookup-without-callout-or-exempt is detected, so non-compliant skills can't sneak through scaffold-then-merge.
+- This catches the AUTHORSHIP miss class. The RUNTIME analog (intercepting MCP tool dispatch when a subagent calls `web_search` without an earlier `gbrain search` in the same turn) is filed as a v0.37+ TODO. Both layers eventually.
+
+What we caught and fixed before merging:
+- Codex's outside-voice review (gpt-5.5) found 18 issues against an earlier draft. Three of them changed the design materially:
+  1. The original plan shipped a one-shot upgrade migration that would have silently edited host SKILL.md files outside the `--fix` git-safety contract. Codex flagged that as smuggling the PR allowlist back in as data. Dropped the migration; doctor surfaces the hint and `--fix` applies via the existing safety gates.
+  2. The original plan auto-exempted skills with `tools: [search, query, put_page]` + `writes_pages: true`. Codex pointed out this covers up the riskiest class (ingest skills that write pages AND call Perplexity). Dropped the rule entirely; brain-tool ownership doesn't prove brain-first compliance.
+  3. The first-pass detection regex scanned the whole file. Codex pointed out `tools: [web_search]` in YAML frontmatter would be the "first external reference" and false-flag the skill. Detection now strips frontmatter before any position-relative scan.
+
+### Itemized changes
+
+#### Added
+
+- **`brain_first: exempt` frontmatter field** — declarative opt-out for skills that don't need brain-first. The single canonical form (`brain_first: exempt`, snake_case, lowercase, unquoted). Near-misses (`brain-first`, `BrainFirst`, quoted values, unknown values) trigger a paste-ready doctor hint instead of silent failure.
+- **`skill_brain_first` doctor check** — scans every SKILL.md under the configured skills dir, detects external-lookup patterns (web_search / web_fetch / exa / perplexity / happenstance / crustdata / captain_api / firecrawl), confirms compliance via canonical Convention callout / explicit Phase 1 brain heading / position-relative brain reference / `brain_first: exempt` opt-out / absence of external pattern. Surfaces structured `Check.issues[]` for JSON tooling; emits formerly-EXEMPT_SKILLS hints for PR #1206's historical 40-name allowlist.
+- **`gbrain doctor --fix` MISSING_RULE_PATTERNS** — `dry-fix.ts` gains an INSERT pattern type alongside the existing REPLACE patterns. Auto-inserts `> **Convention:** see [conventions/brain-first.md](../conventions/brain-first.md) for the lookup chain (search → query → get_page → external).` at the `after-h1-paragraph` site of any flagged skill. Idempotent (re-runs detect the existing callout and skip).
+- **`gbrain skillify scaffold` pre-insert** — `src/core/skillify/templates.ts` now writes the canonical Convention callout into new SKILL.md scaffolds by default. Zero-friction compliance for new skills.
+- **`gbrain skillify check` required item 12** — brain-first compliance is now a real gate, not informational. Exit 1 when an external-lookup skill lacks both the callout and the `brain_first: exempt` declaration.
+- **Snapshot+diff audit at `~/.gbrain/audit/skill-brain-first-YYYY-Www.jsonl`** — transition-only writes. Stable brains produce 0 audit lines per doctor run. `readRecentBrainFirstEvents(7)` exposes the audit for future trend tooling.
+- **Live OpenClaw dev script** at `scripts/live-brain-first-check.ts` — opt-in (`$OPENCLAW_WORKSPACE`-gated) shape report against the live deployment. Not in CI; run manually during dev / QA / post-`--fix` validation.
+- **CI guard `scripts/check-skill-brain-first.sh`** — JSON-parses `gbrain doctor --json` to gate `bun run verify` on `warn` (doctor's exit code only flags `fail`).
+
+#### Changed
+
+- **`src/core/skill-frontmatter.ts`** — NEW shared content-based frontmatter parser. Replaces `filing-audit.ts`'s private path-based `parseFrontmatter`. Adds `tools?`, `triggers?`, `brain_first?: 'exempt'`, and a typed `brain_first_typo` field that surfaces near-miss declarations.
+- **`src/core/skill-fix-gates.ts`** — NEW shared safety primitives module (working-tree check, code-fence guard, etc.). Both REPLACE and INSERT auto-fix patterns consume from here; `dry-fix.ts` re-exports for back-compat.
+- **`skills/conventions/brain-first.md`** — extended with declarative opt-out documentation. New "Declarative opt-out (v0.36.x)" section covers the strict canonical form, typo behavior, and when the opt-out is unnecessary.
+- **PR #1206 hardcoded `EXEMPT_SKILLS` allowlist** — replaced with structural-signal inference + explicit `brain_first: exempt` opt-out. The 40-name list is preserved as `FORMERLY_HARDCODED_EXEMPT` in `src/core/skill-brain-first.ts` purely for doctor-hint flow (CMT1).
+- **`functional-area-resolver` and `strategic-reading` skills in this repo** — gained `brain_first: exempt` frontmatter. Both name `perplexity` in dispatcher prose (sub-skill cross-references) without actually calling external APIs; the regex tripped on word boundary. Declarative opt-out is the canonical fix for this false-positive class.
+
+#### Tests
+
+- New: `test/skill-brain-first.test.ts` (56 cases — frontmatter parser, analyzer ladder across 9 fixtures, offset helpers, regex shape, audit snapshot+diff, PR #1206 regression absorption).
+- New: `test/fixtures/brain-first-skills/*/SKILL.md` (9 fixtures driving the unit + E2E suites).
+- New: `test/e2e/skill-brain-first.test.ts` (12 cases — shape assertions, `--fix` dry-run/apply cycle, idempotency, audit transition signal).
+- Existing: 170 cases in `test/filing-audit.test.ts`, `test/dry-fix.test.ts`, `test/doctor*.test.ts` pass unchanged (regression-preservation).
+
+#### Removed
+
+- Nothing user-facing. The `parseFrontmatter` function inside `filing-audit.ts` is now a thin wrapper over the new shared parser — internal refactor only.
+
+#### For contributors
+
+- The brain-first regex is intentionally permissive (word-boundary `\bperplexity\b` etc.). False-positives on name mentions in dispatcher prose are expected and answered by the declarative opt-out. Tightening to require API-call shape is a v0.36.x+ TODO.
+- The runtime MCP-dispatch brain-first gate is the bigger follow-up wave. Static-check covers authorship; runtime covers compliance. Filed as v0.37+ TODO.
+- Co-Authored-By: garrytan-agents (PR #1206 contributor) — the EXEMPT_SKILLS list shape, regex set, and tweet-shield incident framing carry forward verbatim.
+
+## To take advantage of v0.37.3.0
+
+`gbrain upgrade` runs `gbrain post-upgrade` which runs `gbrain apply-migrations`.
+This release has no schema migrations — every change is filesystem-only — so the
+upgrade is purely the binary swap.
+
+1. **Verify the new check landed:**
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name == "skill_brain_first")'
+   ```
+2. **If your skills dir flags any violators**, the easiest fix is the auto-fix:
+   ```bash
+   gbrain doctor --fix --dry-run  # preview
+   gbrain doctor --fix            # apply (writes the canonical callout)
+   ```
+   Or for genuine infra skills, add `brain_first: exempt` to the frontmatter manually.
+3. **Your agent reads `skills/conventions/brain-first.md` the next time you interact with it.** The new "Declarative opt-out" section documents the contract; no manual agent prompt update needed.
+4. **If `gbrain doctor` reports unexpected violations or any step fails,** file an issue: https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor --json | jq '.checks[] | select(.name == "skill_brain_first")'`
+   - the SKILL.md of the surprising flag
+   - whether `--fix` cleaned it up
+
+   The brain-first detection is regex-based and will hit false-positives on
+   skills that NAME but don't CALL the external tools. Declarative opt-out
+   (`brain_first: exempt`) is the canonical answer for that class.
+
+## [0.37.2.0] - 2026-05-19
+
+**Your grading script writes "unresolvable" verdicts now. Before this fix, every single one was rejected at the database layer — 0 of 34 writes landed in a recent production run.**
+
+When the v0.36.1.0 calibration wave grades a take, the judge can return one of four outcomes: correct, incorrect, partial, unresolvable. Unresolvable means "we tried but the evidence wasn't there to decide." The database constraint that v0.36.1.0 added only accepted the first three. Anything writing an unresolvable verdict hit a CHECK constraint violation and silently dropped the row. This hotfix widens the constraint and surfaces unresolvable as a first-class quality + a measurable scorecard signal, so a brain with 50% unresolvable verdicts can read that as "your retrieval is weak in this domain" instead of "no data."
+
+Hotfix-narrow. No prompt changes, no LLM dependencies, no eval gates. Rebased on top of v0.37.1.0 during a second master-merge collision — the work was originally cut against v0.36.1.0 as v0.36.1.1, but master shipped v0.36.1.1 + v0.36.2.0 + v0.36.3.0 + autonomous-remediation through v0.37.0.0 in parallel, then v0.37.1.0 (brainstorm/lsd) claimed v79. Migration renumbered v74 → v79 → v80; everything else (engine widening, scorecard sibling fields, R1-R5 tests) is unchanged. The full feature wave (falsifiability scoring, propose-side dedup, per-category calibration) follows separately as a follow-up minor.
+
+### What you can now do
+
+- Run your grading script and have unresolvable verdicts actually persist. `gbrain takes resolve <slug> --row N --quality unresolvable [--evidence "..."] [--by gbrain:grade_takes]` works through the CLI; `engine.resolveTake({ quality: 'unresolvable', resolvedBy: '...' })` works through the SDK.
+- Read the unresolvable rate as a calibration signal: `engine.getScorecard(...)` returns two new sibling fields, `unresolvable_count` and `unresolvable_rate`. The denominator is `resolved + unresolvable_count`, so a 50% rate means half your grade-attempted takes ran into evidence gaps. The existing `resolved` field deliberately keeps its 3-state meaning so historical scorecards compare apples-to-apples.
+
+### Numbers that matter
+
+| Metric | Before v0.37.2.0 | After v0.37.2.0 |
+|---|---|---|
+| `quality='unresolvable'` writes accepted | 0% (CHECK violation) | 100% |
+| Production v3 run write rate | 0 / 34 | 34 / 34 |
+| `unresolvable_rate` field on `TakesScorecard` | absent | present, NULL when no data |
+| Historical `partial_rate` / `accuracy` / `brier` semantics | (v0.36.1.0) | unchanged — sibling-field design preserves comparison |
+
+### How the fix works
+
+Two CHECK constraints lived on the `takes` table after v0.36.1.0:
+
+1. A table-level `takes_resolution_consistency` constraint enforcing valid `(resolved_quality, resolved_outcome)` pairs. Migration v80 widens it to admit `('unresolvable', NULL)` alongside the existing `('correct', true)` / `('incorrect', false)` / `('partial', NULL)` / `(NULL, NULL)` pairs.
+2. A column-level CHECK on `resolved_quality` enumerating valid string values. Migration v80 drops it (both the auto-generated Postgres name `takes_resolved_quality_check` and the new explicit name `takes_resolved_quality_values`) and re-adds it with the 4-state list.
+
+Existing rows are unaffected. The `(NULL, NULL)`, `('correct', true)`, `('incorrect', false)`, and `('partial', NULL)` shapes still satisfy both new CHECKs. ALTER TABLE briefly acquires `AccessExclusiveLock` to validate existing rows — on a 36K-row takes table this is sub-second. Larger brains (>1M rows) may see a few seconds of write blocking during migration.
+
+### To take advantage of v0.37.2.0
+
+`gbrain upgrade` runs migration v80 automatically. If your grading script was failing today:
+
+1. **Run the migration:**
+   ```bash
+   gbrain upgrade
+   gbrain doctor  # verify schema_version >= 80
+   ```
+2. **Re-run your grading script.** Unresolvable verdicts now persist; the constraint accepts them.
+3. **Read the new metric:**
+   ```bash
+   gbrain calibration  # shows unresolvable_rate on the scorecard
+   ```
+
+If `gbrain doctor` reports a partial migration:
+```bash
+gbrain apply-migrations --yes
+```
+
+If anything still fails, file an issue at https://github.com/garrytan/gbrain/issues with `gbrain doctor` output and `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+### Itemized changes
+
+#### Schema
+- **`src/core/migrate.ts`** — new migration v80 `takes_unresolvable_quality_v0_37_2_0`. Idempotent. Drops + re-adds both the column-level CHECK (now named `takes_resolved_quality_values`) and the table-level `takes_resolution_consistency` CHECK with `'unresolvable'` admitted. Renumbered from v74 → v79 → v80 during successive master-merge collisions (v0.37.0.0 autonomous-remediation through v78, then v0.37.1.0 brainstorm/lsd claimed v79).
+
+#### Engine surface
+- **`src/core/engine.ts`** — `Take.resolved_quality` widens to `'correct' | 'incorrect' | 'partial' | 'unresolvable' | null`. `TakeResolution.quality` widens to the same 4-state union. `TakesScorecard` gains two new sibling fields: `unresolvable_count: number` and `unresolvable_rate: number | null`. Existing fields (`resolved`, `correct`, `incorrect`, `partial`, `accuracy`, `brier`, `partial_rate`) unchanged.
+- **`src/core/takes-resolution.ts`** — `deriveResolutionTuple` now accepts `quality: 'unresolvable'` (maps to `outcome: null`, same shape as partial). `ScorecardRowRaw.unresolvable_count` is optional so pre-v80 engine responses keep working. `finalizeScorecard` computes `unresolvable_rate = unresolvable_count / (resolved + unresolvable_count)`, NULL when both are zero.
+- **`src/core/postgres-engine.ts`** + **`src/core/pglite-engine.ts`** — `getScorecard` SQL now filters `resolved` to the 3-state subset `('correct','incorrect','partial')` (deliberately, NOT `IS NOT NULL`) so historical comparisons stay valid. New `COUNT(*) FILTER (WHERE resolved_quality = 'unresolvable') AS unresolvable_count` aggregate.
+- **`src/core/utils.ts`** — `rowToTake` type cast widened for the 4th quality state.
+- **`src/core/takes-fence.ts`** — `TakeQuality` type union + `QUALITY_VALUES` set widened to include `'unresolvable'`, so markdown fence parsing accepts the new state alongside CLI and SDK.
+- **`src/commands/takes.ts`** — `gbrain takes resolve --quality` now accepts `unresolvable`. The deprecated `--outcome` boolean alias cannot express unresolvable (same as partial); error message updated.
+
+#### Tests
+- **`test/takes-resolution.test.ts`** — three new cases for `deriveResolutionTuple` covering the unresolvable mapping and contradiction rejection; three new cases for `finalizeScorecard` covering the sibling-field semantics (resolved stays 3-state, unresolvable_rate populates from siblings, legacy pre-v80 raw shape backfills cleanly).
+- **`test/migrate.test.ts`** — four structural assertions on the v80 entry (name, idempotency, both CHECK widenings, regression guard that pre-existing legal pairs aren't dropped) plus six PGLite E2E cases exercising the round-trip: R1 unresolvable persists, R2 pre-v80 `(NULL, NULL)` survives, R3 partial+true still rejected, R4 unresolvable+true/false still rejected, R5 `getScorecard` surfaces the new sibling fields.
+
+#### Docs
+- **`docs/architecture/calibration-quality-gate-spec.md`** — preserved from PR #1191 (now closed) with a historical-context header noting the two-wave split. v0.37.2.0 ships the CHECK fix; the follow-up feature wave ships the rest.
+
+#### For contributors
+- The v0.36.1.0 calibration phases (`propose_takes`, `grade_takes`, `calibration_profile`) were correct: `grade-takes.ts` already returned `null` for unresolvable verdicts so they didn't try to write to the takes table. The bug was external grading scripts (and the future promote path, when it lands) writing the verdict directly. The hotfix lets either path land the same row shape.
+
+## [0.37.1.0] - 2026-05-19
+
+**Your brain can now collide its own ideas.**
+
+You type `gbrain brainstorm "why are AI coding tools converging on the same UX?"` and get back five ideas. Each one cites two pages from your own notes: one that's close to the question, and one from a part of your brain that has no business being there. You see the slugs, you see how far the collision actually traveled (a 0-1 distance score next to each idea), and you can click through to read the source pages. Five minutes ago you didn't know your brain had those connections. The judge filters out anything trivial. Cost about 10 cents.
+
+Then you try `gbrain lsd` on the same question. Lateral Synaptic Drift. The dial is turned to 11: twelve pages from twelve different parts of your brain, the judge is inverted (rejects ideas that score too high on coherence — "too obvious, you'd have thought of this without LSD"), and the system explicitly prefers pages you haven't looked at in 90 days. Most of what comes back is noise. One of them is the thing your brain noticed in its sleep.
+
+This is bisociation, the Arthur Koestler thing. The Open Collider project demonstrated 4-13x distance shift over default prompting. Their version invents distant domains from training data. Ours uses what you already wrote down. That difference matters: every idea cites a real slug in your brain. You can audit it. You can trust it.
+
+**How to turn it on**
+
+```bash
+gbrain upgrade                                    # applies migration v79
+gbrain brainstorm "your question here"            # ~$0.10 per run
+gbrain lsd "your question here"                   # ~$0.30 per run
+gbrain doctor                                     # see brainstorm_health check
+```
+
+By default `brainstorm` saves to `wiki/ideas/<date>-brainstorm-<slug>.md` and `lsd` does not save (its output is ephemeral by design — pass `--save` if an idea lands). The dream cycle skips `mode: lsd` pages automatically so noise does not pollute the calibration profile.
+
+**The numbers that matter**
+
+| Mode | Close set | Far set | Ideas per cross | Judge threshold | Vibe |
+|---|---|---|---|---|---|
+| brainstorm | 4 | 6 | 3 | weighted 4.0/5 | Analyst riffing with their own notes. Defensible. |
+| lsd | 2 | 12 | 4 | inverted: rejects resistance >4.5 | Your brain at 3am noticing what it forgot. |
+
+**Things to watch**
+
+- The "far set" comes from prefix-stratified sampling. One page per top-level prefix (`wiki/vc`, `wiki/biology`, `concepts/`, etc), tiebroken by inbound link count. If your brain has only one or two top-level prefixes you will see a stderr warning that the bank was narrower than usual. Add more cross-domain content via `gbrain import` and the next run gets sharper.
+- LSD's stale-page bias works off a new column `pages.last_retrieved_at` bumped when `search`/`query`/`get_page` returns results. Default-on. If you do not want per-search writes, `gbrain config set search.track_retrieval false` opts out (LSD then runs without the stale-preference signal but still works). Internal callers (sync, migrations, dream cycle) never bump the column — the signal stays clean.
+- Calibration cold-start: if your `calibration_profiles` row has no `active_bias_tags`, the judge runs without anti-bias context and stderr-warns. Both commands still work; the judge just is not penalizing your known biases.
+
+### Itemized changes
+
+**New commands** — `gbrain brainstorm <question>` and `gbrain lsd <question>`, both CLI-only. `gbrain eval brainstorm <fixture.jsonl>` is the three-axis evaluation gate (distance + usefulness + grounding, all three must clear).
+
+**New module** — `src/core/brainstorm/{domain-bank,orchestrator,judges}.ts`. One `judges.ts` exports a shared `runJudge(config, ideas)` plus `BRAINSTORM_JUDGE_CONFIG` + `LSD_JUDGE_CONFIG`, so the two modes share judge plumbing.
+
+**New engine surface** — `BrainEngine.listPrefixSampledPages(opts)` + `BrainEngine.listCorpusSample(opts)`, parity on both Postgres and PGLite. Both accept `sourceId?` and `sourceIds?` for federated-read scoping.
+
+**Schema migration v79** — `pages.last_retrieved_at TIMESTAMPTZ NULL` + full B-tree index on `pages (last_retrieved_at)`. Forward-reference bootstrap added on both engines so pre-v79 brains upgrade cleanly.
+
+**Op-layer write-back** — `src/core/last-retrieved.ts` exports `bumpLastRetrievedAt(engine, pageIds)`. Called fire-and-forget from the `search`/`query`/`get_page` op handlers after results return. 5-minute throttle via the SQL `WHERE last_retrieved_at IS NULL OR last_retrieved_at < NOW() - INTERVAL '5 minutes'` clause skips ~90% of writes on heavily-searched brains.
+
+**Dream-cycle skip** — `src/core/cycle/transcript-discovery.ts` extends `isDreamOutput(content)` to also skip pages with `mode: lsd` frontmatter (noise-by-design). New exports `isLsdOutput()` and `isBrainstormOutput()` for downstream callers.
+
+**Doctor check** — `brainstorm_health` surfaces three signals: migration v79 applied, `search.track_retrieval` setting, calibration cold-start status. Paste-ready fix hints per signal.
+
+**Tests** — 38 new unit tests across `test/brainstorm/{distance,lsd-mode-skip,eval-brainstorm}.test.ts`. Pin distance normalization (same-vector → 0, orthogonal → 0.5, opposite → 1, dimension mismatch throws), LSD frontmatter detection, eval verdict logic, fixture parsing.
+
+## To take advantage of v0.37.1.0
+
+`gbrain upgrade` should do this automatically. If it did not:
+## [0.37.0.0] - 2026-05-19
+
+**Skillpacks become a real ecosystem. You can ship one, someone else can install it, and gbrain has an opinion about quality.**
+
+Pre-v0.37, skillpacks were one bundle — gbrain shipped its own pack at `openclaw.plugin.json` and that was it. v0.37 opens the door: anyone with a GitHub repo (or a tarball) can publish a skillpack, anyone else can scaffold it into their agent workspace, and `gbrain skillpack doctor` scores any candidate pack against a 10-dimension quality rubric with paste-ready fixes for every failure. The model is **scaffolding, not amber** — v0.36 already retired the install/uninstall semantics; v0.37 extends `scaffold` to third-party sources without re-introducing the managed-block trap.
+
+### What you can now do
+
+**Run `gbrain skillpack scaffold garrytan/skillpack-hackathon-evaluation`** and the pack lands in your workspace — files copied additively, refuses to overwrite anything you've edited, source URL + pinned commit + tarball SHA recorded in `~/.gbrain/skillpack-state.json`. First-time scaffold of a new source surfaces a TOFU confirm prompt showing name + author + source + pinned commit + tier; subsequent scaffolds of the same (name, author, pin) triple skip the prompt. Local-path sources skip the prompt entirely (you already own the directory).
+
+**Run `gbrain skillpack search yc`** and see every registered pack with a `yc` tag. Endorsed tier sorts first, community next, experimental last. `gbrain skillpack info <name>` shows full metadata: author, pinned commit, tarball SHA, validated_at timestamp, skill list, gbrain version requirement.
+
+**Run `gbrain skillpack init my-pack`** in an empty directory and you get a complete 10/10 pack tree out of the box: `skillpack.json` + `skills/<name>/SKILL.md` + `routing-eval.jsonl` (5 example intents) + `runbooks/bootstrap.md` + `CHANGELOG.md` + `README` + `LICENSE` + `.gitignore` + `test/` + `e2e/` + `evals/`. Edit the stubs, run `gbrain skillpack doctor . --quick`, run `gbrain skillpack pack`, get a deterministic `<name>-<version>.tgz` ready to publish.
+
+**Run `gbrain skillpack doctor <pack-dir>`** against any candidate pack and see a 0-10 score with per-dimension pass/fail and paste-ready fix commands. The rubric splits into 5 required core dimensions (manifest valid, skills have SKILL.md, routing-evals present, unique triggers, CHANGELOG current) + 5 quality badges (unit tests, e2e tests, LLM-judge evals, bootstrap runbook, license). Tier eligibility: all 10 = endorsed-eligible, >=3 badges = community, core-only = experimental, any core fails = blocked. `--fix --yes` auto-scaffolds the dimensions flagged `auto_fixable: true`.
+
+**Read `examples/skillpack-reference/`** to see the canonical 10/10 pack. It ships inside the gbrain repo, scores 10/10 forever (regression-pinned), and doubles as both a publisher example and an integration-test fixture. `docs/skillpack-anatomy.md` documents the contract one page, auto-generated from the declarative rubric at `src/core/skillpack/rubric.ts`.
+
+### Itemized changes
+
+#### Third-party scaffold path
+
+- `src/core/skillpack/manifest-v1.ts` — runtime validator for third-party `skillpack.json`. Schema is `gbrain-skillpack-v1`; forward-compat `runbook_schema_version` + `eval_schema_version` knobs. Adapter `bundleManifestFromSkillpack` projects onto the v0.36 `BundleManifest` shape so existing `enumerateScaffoldEntries` + `loadSkillSources` paths consume third-party packs without changes.
+- `src/core/skillpack/remote-source.ts` — `classifySpec` + `resolveSource`. Handles owner/repo → github URL expansion, https git clones (via SSRF-hardened `git-remote.ts`), local tarball extraction, and local directories. Cache layout: `~/.gbrain/skillpack-cache/git/<host>/<owner>/<repo>/<sha>/` and `~/.gbrain/skillpack-cache/tarball/<sha256>/`. Stage-then-rename pattern prevents partial-clone cache poisoning.
+- `src/core/skillpack/tarball.ts` — deterministic pack + allowlist-gated extract. GNU tar flags (`--sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner` + `GZIP=-n` + `TZ=UTC`) so same source dir → same SHA. Extract rejects symlinks / hardlinks / devices / FIFOs; caps at 5000 files, 1MB/file, 100MB total, 255-char paths, 100:1 compression ratio.
+- `src/core/skillpack/state.ts` — machine-owned trust store at `~/.gbrain/skillpack-state.json`. Codex outside-voice G1 fix: pinned commits + tarball SHAs + rename maps live here, NOT in editable markdown comments. Atomic `.tmp + rename` write. `isAlreadyTrusted` encodes the codex G4 author-mismatch defense.
+- `src/core/skillpack/trust-prompt.ts` — TOFU first-install confirm with full identity block. Local-path sources skip the gate; tarball + git sources prompt. Non-TTY without `--trust` refuses with an actionable message.
+- `src/core/skillpack/bootstrap-display.ts` — codex T1 fix: post-scaffold runbook is DISPLAYED, never executed. Frame header makes clear: "gbrain deliberately does NOT auto-execute these steps." The agent reads the framed output and walks per-step at its own discretion.
+- `src/core/skillpack/scaffold-third-party.ts` — orchestrator. Composes manifest validation + gbrain version gate + trust prompt + `enumerateScaffoldEntries` + `copyArtifacts` + state.json upsert + bootstrap display.
+- `src/commands/skillpack.ts` extended — `cmdScaffold` disambiguates: contains `/` / `://` / `.tgz` → third-party; bare kebab → bundled-first, registry-fallback. New flags: `--trust`, `--no-cache`.
+
+#### Registry catalog (read side)
+
+- `src/core/skillpack/registry-schema.ts` — validators for `registry.json` (catalog) and `endorsements.json` (Garry-only tier overlay). Codex G3 separation: contributors PR catalog entries with `default_tier: community/experimental/dead`; only Garry edits the overlay file.
+- `src/core/skillpack/registry-client.ts` — fetch + 1h soft-TTL cache + stale-fallback. On fetch failure: serves the last-good cache with a stderr warning; escalates to "cache is stale, run --refresh" past 7 days. Hard-fails only on first-run-with-no-network.
+- `gbrain skillpack search [<query>] [--tier T]` / `info <name>` / `registry [--url URL] [--refresh]` — read-side CLI surface.
+
+#### Quality bar — rubric + doctor + audit
+
+- `src/core/skillpack/rubric.ts` — declarative `SKILLPACK_RUBRIC_V1` array. Single source of truth for doctor + (auto-generated) anatomy doc + tests. Each dimension exports `{id, name, category, description, auto_fixable, check}` and the check function returns `{passed, detail, fix_hint}` so the doctor surfaces paste-ready remediation for every failure.
+- `src/core/skillpack/doctor.ts` — `runDoctor({mode: 'quick' | 'full', fix, yes})`. `--quick` is the structural sweep (~5s, no sandbox / no LLM / no DB) for tight iteration loops. `--fix` walks `auto_fixable` dimensions and scaffolds missing routing-evals / CHANGELOG / test stubs / LLM-judge stubs / bootstrap runbook / LICENSE.
+- `src/core/skillpack/audit.ts` — `~/.gbrain/audit/skillpack-YYYY-Www.jsonl`. ISO-week rotated; mirrors the slug-fallback + rerank-audit patterns. Best-effort writes (never throws); `gbrain doctor` reads recent events for the future activity surface.
+- `gbrain skillpack doctor <pack-dir> [--quick|--full] [--fix] [--yes] [--json]` — exit codes 0 if score=10, 1 if 6-9, 2 if blocked/<5.
+
+#### Publisher side
+
+- `src/core/skillpack/init-scaffold.ts` — `gbrain skillpack init <name>` cathedral default. Scaffolds the complete 10/10 pack tree; freshly-init'd pack scores 10/10 on `doctor --quick` immediately. `--minimal` flag drops test/e2e/evals for power users opting out.
+- `src/core/skillpack/pack-publish.ts` — `gbrain skillpack pack [<pack-dir>] [--out PATH] [--dry-run] [--skip-doctor]` runs `runDoctor(--quick)`, refuses if blocked, packs deterministic tarball. SHA-256 reported on success; publish-gate skill consumes `--skip-doctor` (gate runs server-side).
+- `src/core/skillpack/endorse.ts` — `gbrain skillpack endorse <name> [--tier T] [--repo PATH] [--push] [--dry-run]` is the Garry-only operator workflow. Validates pack is in the catalog, writes `endorsements.json` with stable key ordering, commits with a one-line message `endorse: <name> -> <tier>`.
+
+#### Reference + anatomy doc
+
+- `examples/skillpack-reference/` — real 10/10 pack tree shipped inside the gbrain repo. SKILL.md body teaches the third-party contract; serves as both a publisher example and an integration-test fixture. Regression-pinned by `test/skillpack-reference-pack-is-ten.test.ts` — any change that drops the reference below 10/10 fails the build.
+- `docs/skillpack-anatomy.md` — auto-generated one-page reference. Tree map + rubric tables + tier eligibility + CLI reference. Generator: `scripts/build-skillpack-anatomy.ts` (`--check` mode for CI freshness gating).
+- `docs/designs/SKILLPACK_REGISTRY_V1_SPEC.md` — full strategic spec preserved as the design record. 27 locked decisions across CEO + Eng + DX (two rounds) + Codex outside-voice.
+
+#### v0.36.1.0 drift fixes (tangential cleanup)
+
+The v0.36.1.0 hindsight calibration wave shipped three new cycle phases (`propose_takes`, `grade_takes`, `calibration_profile`) but two E2E tests had stale assertions:
+
+- `test/e2e/cycle.test.ts` phase count 13 → 16.
+- `test/e2e/dream-cycle-phase-order-pglite.test.ts` `EXPECTED_PHASES` updated + `mock.module` block for `embedding.ts` now declares `embedMultimodal` + `embedQuery` (v0.36.1.0 additions).
+
+These were unrelated to skillpack work; surfaced during the cathedral's E2E sweep and fixed as clean-up commits.
+
+### To take advantage of v0.37.0.0
+
+`gbrain upgrade` runs `gbrain apply-migrations` which is a no-op for this release (no schema migrations). To start publishing skillpacks:
+
+1. **Initialize a new pack**: `gbrain skillpack init my-pack`
+2. **Edit + iterate**: `cd my-pack`, edit `skills/my-pack/SKILL.md` + add real routing intents to `routing-eval.jsonl`
+3. **Verify**: `gbrain skillpack doctor . --quick`
+4. **Pack**: `gbrain skillpack pack` → emits `my-pack-0.1.0.tgz` with deterministic SHA
+5. **Publish**: push the pack repo to GitHub; share `owner/repo` for `gbrain skillpack scaffold owner/repo`
+
+To consume a third-party pack:
+
+1. **Search**: `gbrain skillpack search <query>` (when the registry repo at `garrytan/gbrain-skillpack-registry` ships; until then, scaffold by URL)
+2. **Scaffold**: `gbrain skillpack scaffold owner/repo` or `gbrain skillpack scaffold ./path/to/pack.tgz`
+3. **Inspect**: the agent reads the displayed `bootstrap.md` and walks the steps at its own discretion
+
+If `gbrain skillpack doctor` or `gbrain skillpack scaffold` errors out, please file an issue at https://github.com/garrytan/gbrain/issues with the command you ran, the pack source URL or local path, and output of `gbrain doctor`. This feedback loop is how the gbrain maintainers find rough edges in v1 of the third-party skillpack flow.
+
+### Deferred to follow-up waves
+
+- W4.5 retrofit of bundled gbrain skills to 10/10 (content work; multi-day; `doctor --fix --yes` auto-scaffolds most of it).
+- Subprocess sandbox (bwrap / sandbox-exec) for publish-gate trial install (the publish-gate skill itself remains a follow-up; today the publisher runs `doctor --quick` locally and the validation log is the trust artifact).
+- `garrytan/gbrain-skillpack-registry` GitHub repo setup with the CI workflow split (codex G3).
+- Cross-listing in `mvanhorn/printing-press-library` (external repo PR).
+- Generated `gbrain-cli` via Printing Press for non-gbrain agents to hit a remote gbrain.
+## [0.36.6.0] - 2026-05-19
+
+**Your photos finally show up when you ask. The brain just got eyes.**
+**11K image embeddings stopped sitting unused; cross-modal search is live.**
+
+For the past few releases gbrain had image embeddings sitting in a 1024d Voyage multimodal column with a valid 83 MB HNSW index, and no user-facing query path could touch them. Text queries always embedded through the text model. Dimensions didn't match. The image space was dead storage.
+
+This release wires the routing. `gbrain search "show me hackathon photos"` returns image chunks. `gbrain search --image ./screenshot.png` accepts an image as a query. `gbrain reindex --multimodal` flattens both modalities into a single embedding space if you want to commit to unified retrieval. And `search_by_image` over MCP gets a daily Voyage spend cap so an authenticated OAuth client can't burn the operator's account.
+
+Default behavior unchanged for normal text queries. Cross-modal routing fires only on detected image-intent phrasings, with an opt-in Haiku tie-break for genuinely ambiguous wording.
+
+### What lands across five atomic commits
+
+| Commit | What it ships | What it unlocks |
+|---|---|---|
+| 0 | Multimodal embed batching + partial-failure surfacing + query-side wrappers; new SSRF-validate helper with DNS rebinding defense | Foundation for Phase 3 reindex; every URL-fetching feature gets DNS-resolution + per-record A/AAAA inspection |
+| 1 | Text → image search: cross-modal intent regex + hybrid routing + weighted RRF for `'both'` mode + 7 new search knobs in `SEARCH_MODE_CONFIG_KEYS` and `knobsHash` (bumped 2→3) + `gbrain backfill modality` cleanup + doctor check | "show me hackathon photos" now finds image chunks; cache contamination across modality knobs closed |
+| 2 | Image → text/OCR search: `loadImageInput` with SSRF redirect re-validation + 10 MB cap + magic-byte sniff; `search_by_image` MCP op with remote `image_path` ban + daily Voyage spend cap per OAuth client | `gbrain search --image ./photo.jpg "who is this person"` runs; remote MCP clients can submit URLs / base64 but cannot read arbitrary server files |
+| 3 | Phase 3 unified column: schema migration v75 adds `content_chunks.embedding_multimodal vector(1024)`; `gbrain reindex --multimodal` walks NULL rows with checkpoint resume + cost prompt + writer lock; hybrid routing through unified column when `search.unified_multimodal=true` with fail-open + source-aware coverage check | Operators opt into true image→full-text-knowledge retrieval (Phase 2 then auto-upgrades to richer results) |
+| 4 | Opt-in LLM tie-break: when `search.cross_modal.llm_intent=true` AND regex returns 'text' AND query is genuinely ambiguous, a Haiku call refines the routing | Catches "any pictures from last week's offsite?" — the narrow band the regex misses (<1% of queries when on; ~$0.0001 per escalation; fail-open on every error) |
+
+### The numbers that matter
+
+51 new test cases across 8 test files. 6860 unit tests pass after the wave (0 regressions). 620+ E2E tests pass against real Postgres. Schema migrations applied cleanly through v75.
+
+| Surface | Before | After | What changed |
+|---|---|---|---|
+| Image-column query path | dead storage | live retrieval | crossModal flag + multimodal query embedding |
+| `search_by_image` op | did not exist | scope:read MCP op | D18 path ban + size cap + spend cap |
+| Voyage spend per OAuth client | unbounded | $5/day cap (configurable) | mcp_spend_log table + checkBudget gate |
+| SSRF defense on URL fetch | static IP block | static + DNS resolve all records | new `core/ssrf-validate.ts` helper, reusable |
+| Search cache contamination | possible across cross-modal flags | structurally impossible | knobsHash v3 includes 7 new cross-modal knobs |
+| Modality on historical chunks | "image" tag missing on pre-v0.27.1 image-asset rows | doctor surfaces + `gbrain backfill modality` flips them | new registry entry; idempotent |
+
+### What this means for you
+
+You don't need to opt in to anything for the basic improvement: queries that name visual content ("show me", "find images of", "what does X look like") now route through Voyage multimodal-3 and return image chunks that were sitting in the brain. Try `gbrain search "show me hackathon photos"`. If it returns nothing, your image chunks may pre-date the modality tag — run `gbrain doctor` for the paste-ready `gbrain backfill modality` fix.
+
+For the image-as-query workflow, use `gbrain search --image ./photo.jpg`. Pair with `--query "founder mode"` to RRF-merge a text refinement axis.
+
+For the full image→text-knowledge experience (find Alice's bio from a photo, not just visually-similar photos), opt into Phase 3:
+
+```
+gbrain reindex --multimodal --dry-run    # see the cost estimate
+gbrain reindex --multimodal              # ~2-3h on a 100K-chunk brain
+gbrain config set search.unified_multimodal true
+```
+
+Auto-flip prompt fires at coverage=100% so the last step is suggested inline.
+
+### To take advantage of v0.36.6.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about anything:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify migration v79 landed:**
+   ```bash
+   gbrain doctor --json | grep '"schema_version"'
+   ```
+   Should show: `"Version 79 (latest: 79)"`
+3. **Try it:**
+   ```bash
+   gbrain brainstorm "your question here"
+   gbrain lsd "your question here" --save
+   ```
+4. **Check brainstorm_health:**
+   ```bash
+   gbrain doctor --json | grep brainstorm_health
+   ```
+   Should show: `"Migration v79 applied; tracking enabled..."`
+5. **If anything fails,** file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor` and `~/.gbrain/upgrade-errors.jsonl` if present.
+2. **Verify the new surface:**
+   ```bash
+   gbrain doctor | grep -E 'modal|cross'
+   gbrain search modes        # cross-modal knobs should be listed
+   gbrain --tools-json | jq '.[] | select(.name=="search_by_image")'
+   ```
+3. **Backfill historical image chunks** (if doctor surfaces the warn):
+   ```bash
+   gbrain backfill modality
+   ```
+4. **If any step fails or the numbers look wrong,** please file an issue: https://github.com/garrytan/gbrain/issues with `gbrain doctor` output and `~/.gbrain/upgrade-errors.jsonl` if present.
+
+### Itemized changes
+
+#### Phase 1 — text → image routing
+- `src/core/search/query-intent.ts`: new `suggestedModality: 'text' | 'image' | 'both'` axis on `QuerySuggestions`; module-scope `CROSS_MODAL_PATTERNS` regex array; `isAmbiguousModalityQuery` heuristic gate for Phase 4 LLM escalation.
+- `src/core/types.ts`: `SearchOpts.crossModal: 'text' | 'image' | 'both' | 'auto'` + `SearchResult.modality: 'text' | 'image'`.
+- `src/core/search/mode.ts`: 7 new ModeBundle knobs; KNOBS_HASH_VERSION bumped 2→3; SEARCH_MODE_CONFIG_KEYS registry extended.
+- `src/core/search/hybrid.ts`: routing branch resolves effective modality from (per-call opts → suggestions → 'text'); image route embeds via `embedQueryMultimodal`, searches `embedding_image`, skips expansion + keyword; 'both' route runs parallel text + image vector searches with weighted RRF; 'auto' literal normalized to undefined; fail-open on misconfig.
+- `src/core/operations.ts`: `cross_modal` param threaded through `query` op.
+- `src/core/backfill-registry.ts`: new `modality` backfill kind with `chunk_source='image_asset'` defensive guard.
+- `src/commands/doctor.ts`: `cross_modal_modality_backfill` check.
+
+#### Phase 2 — image-as-query
+- `src/core/ssrf-validate.ts`: new core helper. `validateAndResolveUrl` does DNS lookup with all records, rejects ANY internal-resolving record. `fetchWithSSRFGuard` re-validates every redirect hop and limits chain depth (default 3). Reusable for any URL-fetching feature.
+- `src/core/search/image-loader.ts`: `loadImageInput` accepts local path, data: URI, or http(s):// URL. Magic-byte sniff for PNG/JPEG/WebP. 10 MB cap (configurable). 5s fetch timeout. Pre-flight Content-Length + post-fetch size guard for lying servers.
+- `src/core/search/by-image.ts`: `searchByImage` always runs image branch; D13 hybrid intersect runs parallel text branch when `query` is provided.
+- `src/core/operations.ts`: new `search_by_image` op (scope: read, NOT localOnly). Remote callers with `image_path` set rejected with permission_denied. Source-id threaded via sourceScopeOpts. Per-param length cap. Pre-flight budget gate + post-call spend record.
+- `src/core/spend-log.ts`: BudgetExceededError + checkBudget + recordSpend + getTodaySpendCents. UTC day-aligned. Local CLI bypasses gate; pre-v0.36 brains fail open.
+- `src/core/migrate.ts` v74: new `mcp_spend_log` table + BTREE indexes.
+
+#### Phase 3 — unified multimodal column
+- `src/core/migrate.ts` v75: `ALTER TABLE content_chunks ADD COLUMN embedding_multimodal vector(1024)`. Column-only — HNSW partial index deferred to post-reindex build per pgvector best practice.
+- `src/schema.sql` + `src/core/pglite-schema.ts`: column added inline so fresh installs land at head.
+- `src/core/types.ts`: `SearchOpts.embeddingColumn` type widened to include `'embedding_multimodal'`.
+- `src/core/postgres-engine.ts` + `src/core/pglite-engine.ts` `searchVector`: route to unified column when opts set. NO modality filter (column carries both text + image).
+- `src/core/search/hybrid.ts`: when `search.unified_multimodal: true`, bypass dual-column branching and run unified routing. Fail-open: zero rows + not strict → fall through to dual-column. Strict mode (`unified_multimodal_only`) blocks fallback.
+- `src/commands/reindex-multimodal.ts`: new `gbrain reindex --multimodal [--limit N] [--dry-run] [--cost-estimate] [--no-embed] [--yes] [--json]`. Writer lock acquisition (6h TTL). Cost prompt + 10s Ctrl-C grace in TTY. `GBRAIN_NO_REEMBED=1` bypass. Checkpoint resume. Auto-flip prompt at coverage=100% completion.
+- `src/cli.ts`: dispatch.
+- `src/commands/doctor.ts`: `unified_multimodal_coverage` check reports per-source coverage when flag on.
+
+#### Commit 4 — LLM intent escalation (opt-in)
+- `src/core/search/llm-intent.ts`: `classifyModalityWithLLM(query, fallback)` via `gateway.chat()` with fixed system prompt. 1s timeout. Fail-open on every error.
+- `src/core/search/hybrid.ts`: escalation branch gated by (no explicit per-call opt) AND (regex returned 'text') AND (config flag on) AND (isAmbiguousModalityQuery true).
+
+#### Tests
+- `test/embed-multimodal-batching.test.ts` (13 cases)
+- `test/ssrf-validate.test.ts` (20 cases)
+- `test/cross-modal-phase1.test.ts` (45 cases)
+- `test/cross-modal-hybrid-integration.test.ts` (7 cases)
+- `test/cross-modal-phase2.test.ts` (15 cases)
+- `test/search-by-image-op.test.ts` (7 cases)
+- `test/unified-multimodal.test.ts` (8 cases)
+- `test/llm-intent-escalation.test.ts` (14 cases)
+- `test/llm-intent-hybrid-integration.test.ts` (6 cases)
+
+#### For contributors
+- D10 reindex-core extraction filed as a follow-up: markdown and multimodal reindex commands diverge enough in their core loop that extracting shared infrastructure (cost prompt, lock, checkpoint) is larger than this PR can absorb cleanly. Both commands stand alone with the same patterns.
+- The `voyage-multimodal-3` real-API E2E test fails against Voyage's current API because the test fixture is AVIF and Voyage now rejects that format. Fix is a separate one-line fixture swap; failure is pre-existing on master.
+
+Closes #1127 (spec doc preserved at `docs/issues/cross-modal-search.md`).
+
+## [0.36.5.0] - 2026-05-18
+
+**Your agent picks which secrets to pass to a shell job by name. The worker resolves the values; names land in the row, values don't.**
+
+If you submit a `gbrain` CLI command as a shell job, you have hit the env-stripping wall and probably worked around it the way PR #1137 documented: write secrets into `~/.gbrain/config.json` plaintext, or pass `env: { GBRAIN_DATABASE_URL: "..." }` per job. Both work. The per-job pattern in particular lands the URL in `minion_jobs.data` (a real DB row) and in the shell-audit JSONL — so if your brain ever travels (shared via mounts, dumped, backed up), the URL travels with it.
+
+v0.36.5.0 adds a new shell-job field: `inherit: ["database_url", "anthropic_api_key", ...]`. Pass any snake_case config-key name on it. The worker resolves the value from its `loadConfig()` at child-spawn time and injects it into the child env (`database_url` → `GBRAIN_DATABASE_URL`; `anthropic_api_key` → `ANTHROPIC_API_KEY`; convention is uppercase). Names persist to the row + audit; values resolve fresh on every spawn and never persist from `inherit:` itself. Validation runs **pre-enqueue** in both submit surfaces — `gbrain jobs submit shell` (CLI) and the `submit_job` MCP op — so a malformed payload never lands in `minion_jobs.data`.
+
+The validator does NOT police WHICH config keys you inherit. The agent submitting the minion is in the same uid as the worker; it's the agent's call. If you want a value in the row (non-secret correlation token, OR a secret you've decided is fine to persist), keep using `env:` — that path is unchanged. Use `inherit:` when you want the value OUT of the row.
+
+This wave started as a 4-layer cathedral (encrypted vault + Unix-socket broker + SO_PEERCRED + per-call tokens). The /cso audit cut it as security theater for the single-uid topology that's actually deployed — gbrain runs on your machine, hermes and openclaw run as your uid, defending against same-uid attackers is moot. Codex's outside-voice pass then caught the load-bearing correctness bug in the "minimum-scope" plan: validation in the worker handler runs AFTER `queue.add()` has already persisted the row, so the headline "input-secrets never persist" claim was technically false. Fixed by lifting validation to a shared module called pre-enqueue from both submit paths.
+
+### What you can now do
+
+**Submit shell jobs that pass any subset of secrets the agent needs.**
+
+```bash
+gbrain jobs submit shell --params '{
+  "cmd": "gbrain sync --skip-failed && gbrain embed --stale",
+  "cwd": "/data/gbrain",
+  "inherit": ["database_url", "anthropic_api_key", "voyage_api_key"]
+}'
+```
+
+The worker resolves each name from its config and injects values under the derived env-key names. The `minion_jobs.data` row carries `inherit: ["database_url", "anthropic_api_key", "voyage_api_key"]` — names only. The shell-audit JSONL records the same. Pre-enqueue validation rejects the submission if the worker can't resolve a requested name, with a paste-ready `gbrain config set <X>` hint.
+
+**Inherit any custom config-key.** If you stuff `my_custom_token` into `~/.gbrain/config.json`, `inherit: ["my_custom_token"]` works — child env gets `MY_CUSTOM_TOKEN`. No allowlist. The validator only enforces snake_case shape (prototype-pollution defense for the `__proto__` / `constructor` family).
+
+**Use `env:` when you want the value in the row.** `env: { CORRELATION_TOKEN: "audit-trail-uuid-abc" }` works the same as it always has. The validator doesn't second-guess.
+
+**Surface `~/.gbrain` worktree risk via `gbrain doctor`.** New check `home_dir_in_worktree` walks up from `gbrainPath()` (honoring `GBRAIN_HOME`) looking for a `.git` directory OR file — both shapes — and warns if found. Handles linked worktrees correctly (the Conductor + git-worktrees topology this branch was developed in literally hits this path). Walk terminates at `$HOME` so a `.git` above your home doesn't false-positive.
+
+**Get `~/.gbrain/.gitignore` retroactively.** Every `saveConfig()` call AND every `gbrain post-upgrade` now lays down a single-line `*` gitignore in `~/.gbrain/`. Idempotent — never clobbers user customization. Honest scope: this blocks casual `git add ~/.gbrain` from inside an enclosing worktree, but does NOT cover already-tracked files, screenshots, backup tools (Time Machine / iCloud / Dropbox), or `git add -f`. The doctor check surfaces what the `.gitignore` can't.
+
+**Read `docs/guides/agent-to-gbrain.md`** for the canonical two-domain framing for downstream agent authors: MCP ops via thin-client OAuth for everything with an MCP equivalent, shell job + `inherit:` for the `localOnly` admin ops (`sync`, `embed`, `dream`, `doctor`, `autopilot`). Not a fallback hierarchy — pick by op.
+
+### Itemized changes
+
+- **`src/core/minions/handlers/shell-inherit.ts`** (NEW) — three small helpers. `INHERIT_NAME_RE` (snake_case regex), `deriveEnvKey(name)` (config-key → child-env-key with `database_url` → `GBRAIN_DATABASE_URL` override), `resolveInheritValue(cfg, name)` (uses `Object.hasOwn` to defeat prototype-pollution lookups).
+- **`src/core/minions/handlers/shell-validate.ts`** (NEW) — `validateShellJobParams(data, opts?)` shared validator called pre-enqueue from both submit surfaces. Existing cmd/argv/cwd/env shape checks + new `inherit` shape check (array of snake_case strings) + fail-fast on missing config value. The test seam `opts.config` lets unit tests drive the validator hermetically.
+- **`src/commands/jobs.ts`** — `gbrain jobs submit shell` calls `validateShellJobParams(data)` before `queue.add()`. Audit-log call extends to record `inherit: [...]` names.
+- **`src/core/operations.ts`** — `submit_job` op for `name === 'shell'` runs the same pre-enqueue validator AND lifts the shell-audit JSONL write so the MCP-op path also produces audit lines (codex F-CDX-4).
+- **`src/core/minions/handlers/shell.ts`** — `ShellJobParams.inherit?: string[]` + `ShellJobParams.redact_secrets?: boolean`. `buildChildEnv` resolves names via `resolveInheritValue` and injects under `deriveEnvKey(name)`. When `redact_secrets` is true, the handler builds a redaction map (inherit-name → value) and post-processes `stdout_tail` / `stderr_tail` via `redactSecretsInText` before throw/return. Handler-entry re-validation as defense-in-depth catches pre-existing rows.
+- **`src/core/minions/handlers/shell-redact.ts`** (NEW) — pure `redactSecretsInText(text, secrets)` helper. String-mode `replaceAll` so regex metacharacters in values are treated as literal (safety property). Empty values in the map are skipped.
+- **`src/commands/jobs.ts`** — CLI flag `--redact-secrets` merges `redact_secrets: true` into params before validation. Convenience for `gbrain jobs submit shell --redact-secrets`.
+- **`src/core/minions/handlers/shell-audit.ts`** — `ShellAuditEvent.inherit?: string[]` (names only).
+- **`src/core/config.ts`** — `ensureGitignore()` helper. Idempotent; never clobbers user content. Called from `saveConfig()`.
+- **`src/commands/upgrade.ts:runPostUpgrade`** — calls `ensureGitignore()` once per upgrade.
+- **`src/commands/doctor.ts`** — new `home_dir_in_worktree` filesystem check.
+- **`docs/guides/minions-shell-jobs.md`** — new `#secrets` section. Documents free-form `inherit:`, output-side leakage caveat, error catalog.
+- **`docs/guides/agent-to-gbrain.md`** (NEW) — single-page guide for downstream agent authors. Two-domain framing (MCP ops via thin-client OAuth vs `localOnly` admin ops via shell-job `inherit:`), decision table, migration recipe.
+- **`docs/UPGRADING_DOWNSTREAM_AGENTS.md`** — v0.36.5.0 section with before/after recipe and error-handling table.
+- **New tests** (50+ cases across 5 files):
+  - `test/minions-shell-validate.test.ts` — every validation path (shape, snake_case regex, fail-fast, prototype-pollution defense, the deliberate non-rules) + T1 regression guard pinning the load-bearing invariant.
+  - `test/minions-shell-inherit.test.ts` — `INHERIT_NAME_RE` matrix (10 accepts, 10 rejects), `deriveEnvKey` per-name behavior, `resolveInheritValue` round-trip including `__proto__` / `constructor` / `toString` prototype-pollution cases.
+  - `test/config-ensure-gitignore.test.ts` (6 cases) — idempotency, no-clobber, GBRAIN_HOME honored.
+  - `test/doctor-home-dir-in-worktree.test.ts` (5 cases) — walks dir-style + file-style `.git`, walk termination at $HOME, GBRAIN_HOME override.
+  - `test/e2e/minions-shell-pglite.test.ts` (+2 cases) — full PGLite round-trip: `inherit: ["database_url"]` resolves into child env (negative-shape JSON assertion that value is NOT in row), AND a separate `inherit: ["anthropic_api_key"]` test proving the mechanism is genuinely free-form.
+
+### Output-side redaction (opt-in)
+
+**`redact_secrets: true`** (or `--redact-secrets` on the CLI) opts into
+output-side scrubbing. When set, the worker resolves each `inherit:` name
+to a value, runs the child, then literal-string-replaces every occurrence
+of those values in `stdout_tail` / `stderr_tail` (and in the `error_text`
+derived from `stderr_tail` on non-zero exit) with `<REDACTED:name>` before
+persistence. Only `inherit:`-resolved values are scrubbed; caller-supplied
+`env:` values are not (those are the "I'm fine with this in the row" channel
+by design).
+
+```bash
+gbrain jobs submit shell --params '{
+  "cmd": "gbrain sync --skip-failed",
+  "cwd": "/data/gbrain",
+  "inherit": ["database_url"],
+  "redact_secrets": true
+}'
+```
+
+**Heuristic, not perfect.** Literal string-replace. A script that
+base64-encodes the secret before printing, or emits it one character at a
+time, bypasses the scrub. Those are adversarial shapes; the agent and the
+script are in the same trust domain, so this layer defends against
+accidental echo (the common case), not deliberate exfiltration. Default is
+`false` for back-compat — no behavior change for callers who don't opt in.
+
+### For contributors
+
+The wave's bug-class lesson is worth recording: **in queue-based job systems, validation must run before `queue.add()` if the row contents are part of the security boundary.** Validation in the worker handler runs AFTER persistence; rejecting there leaves the bad payload in the DB row. Codex caught this in plan review; the in-Claude eng review missed it on the first pass. The shared `validateShellJobParams` module exists specifically to make pre-enqueue validation the only path on both CLI and op-handler surfaces; the handler-side call is defense-in-depth only.
+
+Design note on the closed-vs-free-form arc: an early draft of v0.36.5.0 used a closed `INHERITABLE` enum (one record per allowed secret name, with hardcoded shadow-key sets and inline-cmd regex scans). After codex's pre-landing review surfaced multiple bypass paths the closed enum invited (cmd-inline assignments, missed shadow names like `GBRAIN_DIRECT_DATABASE_URL`), the deeper question was: what threat does the allowlist actually defend? On a single-uid topology the agent and worker share trust; refusing to let the agent inherit `voyage_api_key` because it's not on a hand-curated list is paternalism, not security. The shipped design opens `inherit:` to any snake_case config-key. The closed enum is the failure mode this skill avoids.
+
+## To take advantage of v0.36.5.0
+
+`gbrain upgrade` does this automatically — no migrations to run, no host action required.
+
+1. **Verify the new pattern works on your worker host:**
+   ```bash
+   gbrain jobs submit shell --params '{"cmd":"gbrain stats","cwd":"/tmp","inherit":["database_url"]}' --follow
+   ```
+   Expect: page count, exit 0. If you see `shell: inherit requested "database_url" but worker has no database_url configured`, run `gbrain config set database_url <value>` on the worker host once.
+2. **Update your agent code** if it submits shell jobs with `env: { GBRAIN_DATABASE_URL: ... }`. Swap to `inherit: ["database_url"]`. The error message tells you exactly what to change.
+3. **Check the doctor for worktree hygiene:**
+   ```bash
+   gbrain doctor --json | grep -A1 home_dir_in_worktree
+   ```
+   Warn means `~/.gbrain/` lives inside a git worktree. The retroactive `.gitignore` blocks casual `git add`, but consider moving the brain out or setting `GBRAIN_HOME` if you also need backup/screenshare hygiene.
+4. **If any step fails**, file an issue: https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor` and the contents of `~/.gbrain/upgrade-errors.jsonl` if it exists. This feedback loop is how the wedge incidents get caught.
+
+Credit: this wave exists because @garrytan-agents filed PR #1137 documenting the env-stripping gap. The doc made the underlying problem visible enough to fix in code. Thank you.
+
+## [0.36.4.0] - 2026-05-18
+
+**Your agent can now drive your brain to 90/100 by itself, on a cron, without you watching.**
+
+Here is the problem this fixes. Your brain accumulates rot. Pages drift stale,
+embeddings go missing after the next sync, back-links break when slugs get
+renamed, and unsynthesized transcripts pile up in the dream queue. Each fix is
+a one-line command — `gbrain embed --stale`, `gbrain backlinks fix`,
+`gbrain sync` — but knowing WHICH command to run when, and in WHAT order, was
+on you. Run them in the wrong order and you re-do work; skip one and the next
+agent search returns half-stale results.
+
+What ships in this release: one new command that does the whole loop for you.
+
+    gbrain doctor --remediation-plan --json
+    gbrain doctor --remediate --yes --target-score 90 --max-usd 5
+
+The first prints what would be fixed. The second actually fixes it, one job at
+a time, in dependency order, with a spend cap so a synthesize loop can't run
+up your Anthropic bill while you're at lunch. The cap is yours to set per run;
+the plan shows the estimate before you commit. Autopilot (`gbrain autopilot
+--install`) does the same thing automatically on its existing 5-minute tick —
+small problems get a targeted handler, big problems get the full cycle, and a
+healthy brain just sleeps.
+
+### What you can do now that you couldn't before
+
+- **One command takes a degraded brain to your target score.** No more
+  remembering "run sync first, then embed, then backlinks." `gbrain doctor
+  --remediate` figures out the order from a stable dependency graph and walks
+  it sequentially with a re-check between every step.
+- **Cron can drive brain maintenance without supervision.** Pass `--yes
+  --max-usd 5` (or whatever cap you're comfortable with) and it runs
+  unattended. Per-job idempotency keys are content-hashed, so if a job fails
+  the next pass retries with a bumped suffix instead of silently re-serving
+  the dead row.
+- **Spend shows up before you commit.** The plan output prints
+  `est_total_usd_cost` and refuses to submit when it exceeds `--max-usd`.
+  Synthesize / patterns / consolidate carry real Anthropic estimates from
+  `anthropic-pricing.ts`; embed carries OpenAI / Voyage estimates from
+  `embedding-pricing.ts`. Pick the cap that fits your wallet — the loop
+  won't run past it.
+- **Empty brains stop spinning forever.** If your brain is markdown-only
+  (no entity pages) or your embedding API key isn't configured, `--remediate`
+  computes a `max_reachable_score` ceiling and refuses to run when your target
+  exceeds it. Tells you what's missing instead of looping.
+- **`gbrain embed --stale --background` finally exists.** Submits as a Minion
+  job, prints `job_id=N`, exits. Composable in shell pipelines:
+
+      JOB=$(gbrain embed --stale --background | grep -oE 'job_id=[0-9]+' | cut -d= -f2)
+      gbrain jobs follow $JOB
+
+- **Autopilot stops over-running healthy brains.** On a brain at score 95+
+  with nothing to fix, autopilot sleeps for 60 minutes between full cycles
+  instead of grinding through synthesize+patterns+embed every 5 minutes. Real
+  work gets done on degraded brains; healthy brains stop spending tokens on
+  work that has nothing to do.
+- **Eleven new things you can submit as background jobs.** `reindex`,
+  `repair-jsonb`, `orphans`, `integrity`, `purge`, plus six cycle phases
+  (synthesize, patterns, consolidate, extract_facts, resolve_symbol_edges,
+  recompute_emotional_weight) that previously only ran as part of the full
+  autopilot cycle. Three of these (synthesize, patterns, consolidate) are
+  PROTECTED — they can spend Anthropic credits via internal subagent calls,
+  so an MCP-connected agent can't submit them on your behalf. Only trusted
+  local callers (CLI, autopilot, doctor --remediate) can. Your provider bill
+  stays in your hands.
+
+### How autopilot picks what to run
+
+Each tick, autopilot computes a tiny remediation plan from
+`engine.getHealth()` (one SQL count query) and routes by shape:
+
+    score >= 95 AND no plan AND <60min since last full   →  sleep
+    score >= 95 AND no plan AND >=60min                  →  submit autopilot-cycle (phase-coupling exercise)
+    plan <= 3 steps AND est <5min                        →  submit individual handlers (targeted)
+    plan large OR score < 70                             →  submit autopilot-cycle (the hammer)
+
+The cycle lock (`gbrain-cycle`) ensures targeted submissions and the full
+cycle can't run concurrently. The "60-min floor" runs the full phase set
+even on a healthy brain so phase-coupling invariants (lint-first,
+synthesize-before-patterns, embed-after-consolidate) keep getting exercised.
+
+### The numbers that matter
+
+| Operation                     | Before        | After          |
+|-------------------------------|---------------|----------------|
+| Manual brain → score 90       | 4-6 commands  | 1 command      |
+| Autopilot tick cost (healthy) | full cycle    | 1 SQL count    |
+| Failed-job replay window      | wait 60 min   | next pass      |
+| MCP can submit synthesize     | yes (silent)  | no (PROTECTED) |
+| Cron with spend cap           | not possible  | `--max-usd N`  |
+| --background flag             | not supported | composable     |
+
+### To take advantage of v0.36.4.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain
+doctor` warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+
+       gbrain apply-migrations --yes
+
+2. **Verify the outcome:**
+
+       gbrain doctor --remediation-plan --json
+       gbrain doctor --json
+
+   The first should print a plan (possibly empty if your brain is at target).
+   The second should report `schema_version: 2` (unchanged from prior — the
+   new `Check.remediation` field is additive optional).
+
+3. **If you want autopilot to drive your brain autonomously**, add the
+   bootstrap step described in `gbrain autopilot --install`. The new
+   targeted-submit logic activates automatically; no config change needed.
+
+4. **If any step fails or the numbers look wrong**, file an issue at
+   <https://github.com/garrytan/gbrain/issues> with output of `gbrain doctor`
+   and `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+### Itemized changes
+
+- **Schema migration v67 + v68.** `op_checkpoints (op, fingerprint,
+  completed_keys JSONB, updated_at)` is the new shared checkpoint table for
+  long-running ops; pre-fix each op carried its own file-backed JSON or none,
+  which broke on Postgres multi-worker hosts and silently collided across
+  parameter variations. `minion_jobs_doctor_run_id_idx` is a partial GIN on
+  `data WHERE data ? 'doctor_run_id'` so audit queries don't sequential-scan
+  months of cron history.
+- **`src/core/op-checkpoint.ts`** (new). DB-backed checkpoint primitive with
+  per-op fingerprint helpers (`embedFingerprint`, `extractFingerprint`,
+  `reindexFingerprint`, etc.). Fingerprint = sha8 of canonical-JSON of
+  relevant params per op. Closes codex #10–#16 from the outside-voice review.
+- **`src/core/brain-score-recommendations.ts`** (new). Pure data layer
+  consumed by both doctor and features (D15). `computeRecommendations`,
+  `classifyChecks` (remediable / human_only / blocked per D13), and
+  `maxReachableScore` for the ceiling check.
+- **`src/commands/jobs.ts`** registers 11 new Minion handlers: `reindex`,
+  `repair-jsonb`, `orphans`, `integrity`, `purge`, `synthesize` (PROTECTED),
+  `patterns` (PROTECTED), `consolidate` (PROTECTED), `extract_facts`,
+  `resolve_symbol_edges`, `recompute_emotional_weight`. Phase wrappers
+  delegate to `runCycle({phases:[name]})` so cycle.ts remains the single
+  source of truth for phase semantics.
+- **`src/core/minions/protected-names.ts`** extends `PROTECTED_JOB_NAMES`
+  with synthesize/patterns/consolidate. These phases internally submit
+  `subagent` children with `allowProtectedSubmit=true`, so they CAN spend
+  Anthropic credits. Treating them as "data-quality maintenance" was a
+  misread caught by codex outside-voice (#6).
+- **Sync handler fix.** `src/commands/jobs.ts` standalone `sync` handler
+  now passes `noExtract: true` matching `runPhaseSync`'s contract. Pre-fix,
+  doctor's remediation plan emitting `[sync, extract]` caused
+  double-extraction. Closes codex #5.
+- **`src/commands/doctor.ts`** new `--remediation-plan` and `--remediate`
+  CLI surfaces. Stable JSON envelope with `Remediation[]` carrying stable
+  `id`, content-hash `idempotency_key`, `severity`, `est_seconds`,
+  `est_usd_cost`, `depends_on` (referencing ids per D14). `--max-usd N`
+  for cost-bounded cron submissions. `--target-score N` defaults to 90;
+  `max_reachable_score()` refuses unreachable targets with a clear
+  blocker list.
+- **`src/core/cli-options.ts`** new `maybeBackground()` helper. Same
+  semantics in TTY and cron (D9): submit-and-exit. `--background --follow`
+  execs `gbrain jobs follow <id>`. PGLite degrades to inline with a clear
+  stderr note.
+- **`src/commands/embed.ts`** wires `--background` as the reference
+  integration. The other six commands (extract, lint, backlinks, reindex,
+  integrity, pages) adopt the same 4-line pattern in follow-up.
+- **`src/commands/autopilot.ts`** targeted-submit loop replaces blanket
+  `autopilot-cycle` dispatch (T8). Computes plan from cheap path
+  (`engine.getHealth()` + `computeRecommendations`), routes by shape. The
+  60-minute full-cycle floor exercises phase-coupling even on healthy
+  brains. `maxWaiting: 1` per submit closes codex #17.
+- **`src/core/cycle.ts`** purge phase extended (+C folded scope) to GC
+  stale `op_checkpoints` rows (7-day TTL). Non-fatal on pre-v67 brains.
+- **Tests.** 42 new unit tests across `brain-score-recommendations.test.ts`
+  + `op-checkpoint.test.ts` pin D6 #5 (determinism), D9 (content-hash
+  idempotency), D12 (DB-backed checkpoints), D13 (three-state triage),
+  and codex #11/#12/#15 (per-op fingerprint scoping).
+
+Plan: `~/.claude/plans/system-instruction-you-are-working-fluttering-ocean.md`.
+15 decisions locked during `/plan-eng-review`; codex outside-voice surfaced 23
+findings of which 15 were resolved by D9–D15 and 3 expanded scope (cost-budget
+gate, doctor_run_id GIN index, op_checkpoints GC).
+
+### For contributors
+
+- New tasks JSONL artifact at `~/.gstack/projects/garrytan-gbrain/tasks-eng-review-*.jsonl`.
+- T3 (full standalone phase extraction), T11 (E2E test suite), and the
+  remaining 6-of-7 `--background` command integrations are filed as
+  follow-up — the load-bearing pieces (DB-backed checkpoints, shared data
+  layer, new handlers, doctor surface, autopilot rework) shipped this wave.
+- `import-checkpoint.ts` was NOT refactored to a thin shim over op-checkpoint;
+  doing so requires async-propagating the 4 sync call sites in
+  `src/commands/import.ts` and re-writing 18 tests. Deferred — both
+  checkpoint systems coexist for now without conflict.
+
+## [0.36.3.0] - 2026-05-18
+
+**Search now routes through any embedding column you've populated, not just OpenAI 1536. Voyage and ZeroEntropy columns become first-class search targets in one config flip.**
+
+Until this release, gbrain hardcoded `embedding` (OpenAI 1536) as the only column hybrid search could read from. If you'd backfilled `embedding_voyage` (1024d) or `embedding_zeroentropy` (halfvec 2560d) on the side, the index was paid for but unusable. Now `gbrain config set search_embedding_column embedding_voyage` flips your whole brain to Voyage in a single line. The query op also takes `embedding_column` per-call for A/B benchmarking. Adversarial reviews on both the planning and shipping paths caught fifteen real bugs that aren't shipping today — config-plane drift, cosine-rescore corruption when the descriptor's space doesn't match the cache, prototype-pollution via `constructor` as a column key, validation bypass on the descriptor passthrough, and a doctor false-warn on fresh brains.
+
+The numbers that matter:
+
+| Surface | Before | After |
+|---|---|---|
+| Search columns reachable | `embedding` only (1536d OpenAI hardcoded) | Any column in the `embedding_columns` registry — vector or halfvec, any dim ≤ 8192 |
+| Per-call override | image-only via hidden internal flag | `gbrain query --json '{...,"embedding_column":"embedding_voyage"}'` |
+| Cross-column cache contamination | possible if you ever flipped columns | `knobs_hash` v=3 makes `(col, prov)` part of the cache key — silent corruption impossible |
+| `cosineReScore` rerank space | always pulled from `embedding` | pulls from the active column (D9 — Voyage HNSW now ranked against Voyage vectors, not OpenAI ones) |
+| Doctor diagnostics | `embeddings` check only | new `embedding_column_registry` check: format_type dim drift, missing HNSW indexes, coverage <90% gate |
+| Eval replay parity | results changed across column flips ("false regressions") | each `eval_candidates` row stores the column that ran; replay honors it |
+
+What this means: you can run a side-by-side provider eval today. Set `embedding_voyage` as the default for a session, run `gbrain query "..." --json` across your test queries, capture the results, flip back to `embedding`, replay the captured rows with `gbrain eval replay --against ...`, see the Jaccard@k drift between providers. The cache won't lie to you because it sits in a different keyspace for each provider. Doctor will yell if you accidentally point at a column that's only 50% populated.
+
+### Itemized changes
+
+#### Added
+
+- **`embedding_columns` config registry** — declare which content_chunks columns are searchable. JSON map keyed by column name, each entry has `{provider, dimensions, type}` where type ∈ `vector | halfvec`. Set via `gbrain config set embedding_columns '...JSON...'` (DB plane). Validation runs at config-set time: regex on keys, type/dim/provider field shapes. Bad config refuses to load with a paste-ready hint.
+- **`search_embedding_column` config key** — picks the default column for hybridSearch. `gbrain config set search_embedding_column embedding_voyage` flips your whole brain. Coverage gate: refuses the switch when the target column is <90% populated unless you pass `--coverage-override`.
+- **`embedding_column` MCP param on the `query` op** — per-call override for A/B benchmarking. Unknown column names throw a structured error with the list of registered names. The `search` op (keyword-only) deliberately does NOT accept the param — it would be silent UX (CDX-9).
+- **`gbrain doctor` registry check** — `embedding_column_registry` probes each declared column via `format_type(atttypid, atttypmod)` so dim drift (declared 1024d, actual 1536d) surfaces with a paste-ready ALTER. Postgres also checks HNSW index presence; warns if missing. Coverage % on the active default column; warns when below 90% (skips the warn on empty brains).
+- **`isCacheSafe(resolved, cfg)` helper** — the cache-skip decision compares full embedding space (name + dim + model) against cfg, not just the column name. A user who overrides the `embedding` builtin to point at Voyage doesn't accidentally keep using the OpenAI-sized cache.
+
+#### Changed
+
+- **`hybridSearch` resolves the column at the boundary** — engines now take a pre-validated `ResolvedColumn` descriptor, not a raw string. Engine code is config-free and unit-testable in isolation (D11 / CDX-5).
+- **`gateway.embedQuery(text, { embeddingModel, dimensions })`** — query-side embed path accepts a model override. The resolved column's provider drives the embed call, so a query against `embedding_voyage` actually embeds via Voyage, not the global default (D10).
+- **`gateway.isAvailable('embedding', modelOverride?)`** — the availability check honors the override. Hybrid skips vector search only when the column's provider is down, not the global default's (CDX-4).
+- **`engine.getEmbeddingsByChunkIds(ids, column?)`** — `cosineReScore` hydrates embeddings from the active column. Without this, Voyage HNSW retrieval rescored against OpenAI vectors → NaN or wrong rankings (CDX-3 / D9).
+- **`KNOBS_HASH_VERSION` bumped 2→3** — the cache key now folds in column + provider. Pre-v3 cache rows become unreachable on first re-query (one-time miss spike). Source change lives in `mode.ts`, not `query-cache.ts`.
+- **`eval_candidates.embedding_column`** — schema migration v68. Per-row column metadata so `gbrain eval replay` reproduces the same column the capture ran against. NULL-tolerant; pre-v0.36 rows fall back to current default.
+
+#### Fixed (codex /ship findings)
+
+- **Prototype-pollution-safe registry (#1)** — registry uses `Object.create(null)` + `Object.hasOwn`. `gbrain config set search_embedding_column constructor` now correctly rejects rather than resolving to `Object.prototype.constructor`.
+- **Descriptor passthrough re-validates (#2)** — internal SDK callers passing a hand-rolled `ResolvedColumn` get full validation (name regex, type ∈ {vector,halfvec}, dims in [1, 8192]). Eliminates the SQL-injection escape hatch through the descriptor field.
+- **DB-plane config works without a file (#3)** — `loadConfigWithEngine` synthesizes a minimal base when `loadConfig()` returns null. Env-only Postgres installs can `gbrain config set search_embedding_column X` and the resolver actually sees it.
+- **Cache skip is embedding-space-based (#4)** — replaced name-based `isDefaultColumn` with `isCacheSafe(resolved, cfg)` at the call site. User overrides of the `embedding` builtin no longer leak across vector spaces.
+- **Doctor empty-brain UX (#5)** — coverage gate short-circuits when chunk count is 0. Fresh installs no longer see "Active column 'embedding' is 0.0% populated".
+
+#### Tests
+
+- New: `test/search/embedding-column.test.ts` (50 cases — resolver, registry, validation, prototype-pollution, descriptor passthrough, `isCacheSafe`).
+- New: `test/gateway-embed-model-override.test.ts` (8 cases — model/dim override, `isAvailable` override).
+- New: `test/cosine-rescore-column.test.ts` (4 PGLite cases — column-parameter hydration).
+- New: `test/operations-embedding-column.test.ts` (6 cases — `query` accepts param, `search` rejects it).
+- New: `test/e2e/embedding-column-pglite.test.ts` (9 cases — multi-col, halfvec, cosineReScore, unknown-name throw).
+- New: `test/e2e/embedding-column-postgres.test.ts` (7 cases — real-pgvector halfvec, HNSW index visibility, format_type dim drift, coverage gate).
+- New: `test/e2e/eval-replay-column.test.ts` (5 cases — column metadata persistence + replay honors).
+- Extended: `test/search-mode.test.ts`, `test/search/knobs-hash-reranker.test.ts` — v=3 hash, col/prov fields, append-only convention.
+
+#### Plan reviewed
+
+`/plan-eng-review` + codex outside voice surfaced 16 findings during planning + shipping (D1-D16 in the plan + 5 codex /ship findings). Every one applied; the plan file is at `~/.claude/plans/system-instruction-you-are-working-sparkling-sun.md`.
+
+## To take advantage of v0.36.3.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns:
+
+1. Apply the schema migration:
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. (Optional, only if you've backfilled extra columns via ALTER TABLE) declare them in the registry:
+   ```bash
+   gbrain config set embedding_columns '{
+     "embedding_voyage": { "provider": "voyage:voyage-3-large", "dimensions": 1024, "type": "vector" },
+     "embedding_zeroentropy": { "provider": "zeroentropyai:zembed-1", "dimensions": 2560, "type": "halfvec" }
+   }'
+   ```
+3. Verify with doctor:
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name == "embedding_column_registry")'
+   ```
+4. (Optional) flip the default for an A/B run:
+   ```bash
+   gbrain config set search_embedding_column embedding_voyage
+   gbrain query "test query" --json | jq '.results[0]'
+   gbrain config set search_embedding_column embedding  # flip back
+   ```
+
+If any step fails, file an issue at https://github.com/garrytan/gbrain/issues with `gbrain doctor` output and `~/.gbrain/upgrade-errors.jsonl` if it exists.
+## [0.36.2.0] - 2026-05-17
+
+**ZeroEntropy is the new default. Faster, cheaper, better quality on real queries. Existing users get a one-shot switch prompt with cost estimate; new installs land on it out of the box. README rewritten to match what gbrain actually is in 2026.**
+
+Track A flips the default embedding + reranker stack to ZeroEntropy. `zembed-1` at 1280 dims via Matryoshka for embeddings, `zerank-2` cross-encoder reranker on by default in the `balanced` mode bundle. The decision is reversible: `gbrain ze-switch --undo` restores your prior config with a symmetric cost-warning prompt. Track B is a zero-based README rewrite from 884 lines to 139, with the deep-dive content moved into dedicated docs files (`docs/INSTALL.md`, `docs/architecture/RETRIEVAL.md`, `docs/ethos/ORIGIN.md`).
+
+### The numbers that matter
+
+Comparison numbers come from a real-corpus benchmark across 20 hand-curated queries on a 17K-page brain. Three providers, head-to-head:
+
+| Metric | OpenAI | Voyage | ZeroEntropy |
+|---|---|---|---|
+| Top-1 wins (of 20 queries) | 6 | 4 | **11** |
+| Avg latency | 973ms | 559ms | **442ms** |
+| Cost per 1M tokens | $0.13 | $0.06 | **$0.05 (regular) / $0.025 (sale)** |
+| Reshuffle of top-1 as reranker | n/a | n/a | **60%** |
+| Cross-provider overlap | 10-18% (any pair) | — | — |
+
+The cross-provider overlap is the most interesting number: providers literally see different things. Pairing zembed-1 (primary) + zerank-2 (reranker) compounds; that's why default-balanced mode now enables the reranker (it was off in v0.35).
+
+### What this means for the user
+
+**New installs ship faster, cheaper retrieval by default.** No config required: `gbrain init` lands on `zeroentropyai:zembed-1` at 1280d with reranker on. Get a key from [zeroentropy.dev](https://dashboard.zeroentropy.dev), set it via `gbrain config set zeroentropy_api_key sk-...`, done. If you'd rather stay on OpenAI/Voyage, `gbrain config set embedding_model <provider:model>` overrides the default — your choice sticks.
+
+**Existing brains see a one-shot upgrade prompt** the first time you run `gbrain upgrade` to v0.36.2.0. The prompt:
+- Shows the comparison numbers above
+- Splits the cost into schema-change time vs re-embed time (two-line cost UX so the long-running step is honest)
+- Defaults on Enter to STAY (safest); explicit `s` to switch, `l` to ask later, `n` to never ask
+- Re-asks after 90 days if you said never (so a year-later contributor's "we have better benchmarks now" data gets surfaced)
+
+The prompt is TTY-only — non-TTY upgrades (CI, cron, docker) print an informational stderr line and skip. Re-run the switch interactively any time via `gbrain ze-switch`.
+
+**The switch consolidates with the v0.32.7 chunker-bump prompt.** If your brain has both pending (chunker version is stale AND you're switching providers), the `RetrievalUpgradePlanner` computes one combined cost and runs ONE re-embed pass. No double-charging. This was a real bug the original cutover plan had; codex outside-voice caught it pre-implementation.
+
+### What you can now do
+
+**Run with the data behind the default.** `gbrain ze-switch --dry-run` shows you the exact pages-pending, cost estimate, and schema-change time before any change. `--json` makes it agent-readable. `--undo` reverses the switch with a symmetric cost prompt (re-embedding back to the old width costs real money — the prompt is honest about that).
+
+**Switch without TTY.** `gbrain ze-switch --non-interactive` is scripted-deploy-friendly. Errors out without `ZEROENTROPY_API_KEY` set unless you also pass `--ignore-missing-key` (lets you stage the schema change before the key is ready; embeddings will fail loud until the key arrives).
+
+**Recover from a half-applied switch.** Power loss or SIGKILL between schema change and config write puts your brain in a known-bad state: schema width is 1280d but config still says 1536d. `gbrain doctor`'s new `embedding_width_consistency` check catches this and recommends `gbrain ze-switch --resume`, which completes whichever step was missing.
+
+**Verify your config matches your schema.** `gbrain doctor` ships two new ZE-aware checks: `ze_embedding_health` (warns if you configured ZE but no key is set), `embedding_width_consistency` (asserts config dim matches the actual vector(N) column width). Both have paste-ready `gbrain config set` fix hints in the message.
+
+### Itemized changes
+
+#### Track A — ZeroEntropy as default
+
+- `src/core/ai/gateway.ts:45-54` — `DEFAULT_EMBEDDING_MODEL='zeroentropyai:zembed-1'`, `DEFAULT_EMBEDDING_DIMENSIONS=1280`, `DEFAULT_RERANKER_MODEL='zeroentropyai:zerank-2'`. 1280d is the Matryoshka step closest to the prior OpenAI 1536d default; 1024 (Voyage's step) is NOT on ZE's valid-dim list — `ZEROENTROPY_VALID_DIMS = {2560, 1280, 640, 320, 160, 80, 40}`.
+- `src/core/search/mode.ts` — `balanced.reranker_enabled` flipped to `true`. The 60% top-1 reshuffle reaches every default install. Missing-key fail-open contract in `src/core/search/rerank.ts` handles unauthenticated cases (logs to audit JSONL, returns input order unchanged). Opt out with `gbrain config set search.reranker.enabled false`.
+- **NEW** `src/core/retrieval-upgrade-planner.ts` — `RetrievalUpgradePlanner` consolidates the v0.32.7 chunker-bump prompt with the new ZE-switch prompt. Tagged-union `ApplyResult` enum (six states: `applied`, `skipped_already_applied`, `skipped_no_work`, `declined`, `planned`, `failed`). Three config keys (`ze_switch_prompt_shown`, `ze_switch_requested`, `ze_switch_applied`) separate UI state from intent from work-done. `ze_switch_previous_snapshot` JSON captures full prior state for `--undo`. Cost math uses MAX not SUM for the consolidation case — one re-embed pass invalidates both chunker and dim surfaces.
+- **NEW** `src/core/retrieval-upgrade-prompt.ts` — interactive prompt UI. Two-line cost split (schema change ~Xs + re-embed ~$Y for N pages). Privacy callout when reranker flips on. Default-on-Enter = stay (safest). 90-day re-ask window for "never ask again".
+- **NEW** `src/commands/ze-switch.ts` — manual CLI lever (`--dry-run`, `--json`, `--resume`, `--force`, `--undo`, `--non-interactive`, `--confirm-reembed`, `--ignore-missing-key`).
+- `src/core/ai/dims.ts` — `AIConfigError` extended to OpenAI text-embedding-3-{small,large}. Fail-loud at the embed boundary when configured dim is outside the model's Matryoshka range, with a paste-ready `gbrain config set embedding_dimensions <N>` fix.
+- `src/commands/doctor.ts` — two new checks (`ze_embedding_health`, `embedding_width_consistency`).
+- Schema transition runs inside a single `engine.transaction()`: DROP indexes → ALTER COLUMN → CREATE INDEX. HNSW indexes are recreated atomically with the column change — no silent slow-search window where vector queries degrade to sequential scan.
+- **NEW** `skills/migrations/v0.36.2.0.md` — agent-facing migration skill. Tells the agent to surface the retrieval-upgrade prompt to the user post-upgrade.
+
+#### Track B — README rewrite
+
+- `README.md` — 884 lines → 139 lines. 33 H2s → 8. Three "New in vX.Y.Z" hero blocks deleted (CHANGELOG carries history; release notes don't belong in the front door). The 136-line `Commands` section moved to `gbrain --help`. The 6-table skills enumeration collapsed to a one-paragraph capability description + link to `skills/RESOLVER.md`.
+- **NEW** `docs/INSTALL.md` — every install path consolidated into one place. Agent platform, CLI standalone, MCP server (stdio + HTTP). Thin-client mode included.
+- **NEW** `docs/architecture/RETRIEVAL.md` — "why the hybrid + graph stack works." BrainBench numbers, why each strategy alone fails, how source-aware ranking + intent classification + multi-query expansion fit. Lifted from the old README's deep-dive section so the front door stays clean.
+- **NEW** `docs/ethos/ORIGIN.md` — origin story moved out of README. The hero stays factual + concrete (production numbers, benchmark numbers, ZE comparison numbers); the narrative arc lives in its own file.
+- Hero retains every load-bearing fact: OpenClaw + Hermes credit, production numbers (17,888 pages / 4,383 people / 723 companies), BrainBench numbers (P@5 49.1% / R@5 97.9% / +31.4 lift), ZE comparison numbers, install timing claim.
+
+#### Tests
+
+- **NEW** `test/retrieval-upgrade-planner.test.ts` (24 cases) — full state-machine coverage. C3 eligibility logic. Cost math C4 (MAX-not-SUM). Schema transition + HNSW recreation atomicity (D18). Crash recovery via `--resume`. Snapshot captured BEFORE config writes (D16). Undo round-trip.
+- **NEW** `test/ze-switch-cli.test.ts` (11 cases) — CLI shape: `--help`, `--dry-run`, `--json`, `--non-interactive`, `--ignore-missing-key`, `--resume`, `--undo`, `--confirm-reembed`.
+- **NEW** `test/asymmetric-encoding-contract.test.ts` (6 cases) — D17 behavior-test (replaces text-grep). `__setEmbedTransportForTests` captures the HTTP body; asserts `input_type='query'` for the search-time call. Source-text guard is the cheap second layer.
+- **NEW** `test/balanced-reranker-default.test.ts` (10 cases) — D6 mode-bundle flip pinned. Fail-open contract on missing key. Recall-preserving tail when topNIn < results.length.
+- **NEW** `test/doctor-ze-checks.test.ts` (8 cases) — A5 doctor checks.
+- **NEW** `test/ai/dims-openai.test.ts` (16 cases) — D13 OpenAI Matryoshka range validation. Paste-ready fix hint in `fix` field.
+- **NEW** `test/readme-hero-anchors.test.ts` (5 cases) — D9 regression guard. Five load-bearing strings: OpenClaw, Hermes, ZE, production-numbers regex, P@5/R@5.
+
+### To take advantage of v0.36.2.0
+
+`gbrain upgrade` runs the consolidated retrieval-upgrade prompt automatically.
+
+1. **Run the upgrade:**
+   ```bash
+   gbrain upgrade
+   ```
+2. **Read the comparison numbers in the prompt.** Press `s` to switch, Enter to stay (default), `l` to ask later, `n` to never ask.
+3. **If you switched: refill embeddings.** The schema is rebuilt at 1280d but embeddings are NULL until you re-embed:
+   ```bash
+   gbrain embed --stale     # serial; ~$X estimate from the upgrade prompt
+   ```
+   The autopilot cycle's embed phase also walks through this on its own cadence.
+4. **Verify:**
+   ```bash
+   gbrain doctor
+   ```
+   `ze_embedding_health` should be green; `embedding_width_consistency` should report schema and config both at 1280.
+5. **If you regret it:** `gbrain ze-switch --undo`. Restores your prior model + dim + reranker state. Re-embeds at the old width with the same symmetric cost prompt.
+
+If the prompt didn't fire (non-TTY upgrade, you already said "never"), run `gbrain ze-switch` manually to see it, or `gbrain ze-switch --force` to bypass the prompt-shown gate.
+
+If any step misbehaves, please file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor --json` and the relevant `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+Credit: ZeroEntropy ([@zeroentropy](https://zeroentropy.dev)) for the embedding + reranker stack. Codex outside-voice review caught the double-re-embed bug class pre-implementation.
+## [0.36.1.1] - 2026-05-18
+
+**Twenty-eight community-reported bugs fix themselves on your next `gbrain upgrade`.** The most painful ones first: fresh installs work again, `/admin` actually serves the dashboard, `gbrain config set openai_api_key` stops echoing your secret to stderr, and `extract_facts` no longer dead-letters autopilot when a sync no-op passes an empty slug list.
+
+Here's what was happening. The community filed ~40 bug reports against gbrain over the last few weeks. Some were duplicates of fixes that already shipped in v0.35.x. Some were real, painful, and unfixed. Fresh PGLite installs wedged on the v0.11.0 Minions migration. Globally-installed `gbrain serve --http` returned 404 on `/admin` because the React dashboard was checked into git but never embedded into the compiled binary. Configs with `provider: voyage` + `model: voyage-3` silently fell through to OpenAI and errored out. Autopilot respawned in tight loops on brains where the orphans phase warned every cycle. None of these were one-line fixes — they all had real root causes worth understanding.
+
+This release is the cleanup pass. 22 community PRs + 14 issues closed as already-shipped (with thank-you notes attributing each contributor). 28 atomic fixes in this PR, one per commit, each with its regression test. No new features. No breaking changes. Just bugs that hurt users, fixed.
+
+### How to get it
+
+```bash
+gbrain upgrade
+```
+
+Your install picks up everything below. If `/admin` was broken for you, it works after this upgrade. If your `gbrain sync --source-id work` was silently writing to the default source — well, master already fixed that since v0.18, but the regression test suite locking it in is new in this release. If you were on `provider: voyage` config shape, gbrain now translates it to `embedding_model: voyage:...` and prints a one-line nudge to update your config.
+
+### The fixes that matter most
+
+**Fresh-install / upgrade reliability:**
+- `/admin` 404 on every globally-installed binary (#1090). The React SPA is now auto-embedded via `with { type: 'file' }` ESM imports — same pattern as the tree-sitter WASMs. New `scripts/build-admin-embedded.ts` generator + CI guard prevents the embed manifest from drifting against `admin/dist/`.
+- PGLite + `gbrain apply-migrations --yes` wedge (#1100). The pre-flight schema-version probe held the single-writer lock briefly and raced the v0.11.0 phase A subprocess; phase A spawned `gbrain init --migrate-only` which deadlocked. Pre-flight skips PGLite; phase A routes in-process for PGLite. Verified end-to-end on a fresh install — the full migration chain through v0.32.2 walks cleanly.
+- `gbrain upgrade` "no package.json" failure (#1029). Now resolves Bun's global install root via `$BUN_INSTALL` or `~/.bun/install/global`; works regardless of cwd. Contributed by @mvanhorn.
+
+**Data-loss / silent wrong-destination writes:**
+- `extract_facts` with `slugs: []` was triggering an unscoped full-brain walk (#1096). On multi-thousand-page brains this exceeded the autopilot-cycle timeout and dead-lettered the job. Empty array is now a real no-op; missing key preserves the legacy unscoped walk.
+- Voyage / Cohere / Mistral users with legacy `provider` + `model` config silently fell through to OpenAI (#1086). gbrain now translates to `embedding_model: <provider>:<model>` at load time with a one-line stderr nudge to update the config.
+- Embedding responses with mismatched length now fail loud before indexing (#925). Pre-fix, a provider returning N-1 embeddings for N inputs silently indexed an offset-shifted result.
+- `gbrain sync --source-id X` source-routing is now locked in with 6 PGLite regression cases (#891, #978, #1078). The threading was correct in master since v0.18, but no regression coverage existed — a future refactor could have silently re-introduced the bug.
+
+**Security / privilege:**
+- `gbrain config set openai_api_key sk-...` no longer echoes the key value to stderr (#892). Sensitive-key matcher uses word-boundary regex so `monkey` doesn't false-positive. Cherry-pick of @sharziki's PR.
+- `verifyAccessToken` now throws `InvalidTokenError` on expired/invalid tokens so the SDK's bearer-auth middleware returns 401 instead of 500 (#935). Cherry-pick of @Aashiqe10's PR.
+- Admin bootstrap token: new `GBRAIN_ADMIN_BOOTSTRAP_TOKEN` env override (32+ char, validated) + `--suppress-bootstrap-token` CLI flag (#1024). Production deployments stop leaking the token to log aggregators on every supervisor restart.
+- Admin dashboard register-client supports `authorization_code` + PKCE public clients (claude.ai Custom Connector, Cursor) (#1077). Cherry-pick of @lukejduncan's PR.
+
+**Reliability / UX:**
+- Autopilot stop respawn-storm from steady-state `partial` cycles (#1113). Trips only on `failed` now. Cherry-pick of @sergeclaesen's PR.
+- `gbrain doctor` no longer warns about a missing whoknows fixture for every install that isn't standing in the source repo (#969). Cherry-pick of @mvanhorn's PR.
+- Frontmatter `--fix` backups land under `~/.gbrain/backups/frontmatter/` instead of polluting the brain repo (#902). Cherry-pick of @100yenadmin's PR.
+- `gbrain query` source-id routing fixes — `--no-expand` actually negates `expand` instead of being a literal `no_expand` key (#1124); cache writes drain before CLI exit so the warmup works (#1125). Cherry-picks of @hnshah's PRs.
+- 17 more cherry-picks across `serve-http.ts` (405 on GET /mcp, CORS, PKCE admin register), `sync.ts` (.tf/.tfvars/.hcl extensions, skip-pull-no-origin, scope auto-embed), `doctor.ts` (child-table orphan detection, whoknows fixture), `oauth-provider.ts` (InvalidTokenError), `autopilot.ts` (~/.zshenv source order), `backlinks.ts` (dedupe source/target pairs), and `cycle.ts` (dream audit-only).
+
+### What's deferred
+
+Four items shipped a clear roadmap message instead of an incomplete fix:
+- **#803 OAuth auth-code flow.** The MCP SDK does plaintext compare against `getClient().client_secret` — but we store the hash at rest (correct security posture). No clean SDK override seam exists. The proper fix is our own `/token` endpoint that bcrypt-verifies against `oauth_clients.client_secret_hash` and bypasses `mcpAuthRouter` for `/token`. ~1-2 day dedicated PR.
+- **#983 CORS allowlist.** Tightening CORS without a compatibility matrix of legitimate browser-based MCP origins (claude.ai, Perplexity dashboard, our own admin SPA) risks breaking real clients.
+- **#984 connection-manager disconnect cancel.** Touches the shutdown path; needs careful review against the v0.31.3 stdio-MCP lifecycle work.
+- **#888 fs wikilink slug resolution.** Conflicts with master's recent slug-resolution work; needs rebase + re-review.
+
+### To take advantage of v0.36.1.0
+
+`gbrain upgrade` handles this. Most fixes apply on next CLI invocation. The `/admin` embed fix and the schema-bootstrap fixes activate after the binary is replaced — `gbrain upgrade` does that automatically.
+
+Verify:
+```bash
+gbrain doctor --json | jq '.status'  # should be "ok"
+gbrain config show                   # confirm `provider`/`model` translated to `embedding_model` if you had the legacy shape
+gbrain --version                     # should be 0.36.1.0
+```
+
+If `gbrain doctor` still warns about anything after upgrade, please file an issue with the JSON output and your starting schema_version.
+
+### Acknowledgments
+
+Real appreciation for the community on this release. The bug-report volume was a strong signal — it's how we knew which structural fixes to prioritize. Contributors credited inline above and in `Co-Authored-By:` trailers on each commit: @100yenadmin, @aadachi, @Aashiqe10, @amreshtech, @ArshyaAI, @bnc-ss, @clarajohan, @Cossackx, @curtitoo, @DF-FrancoOS, @DmitryBMsk, @hesong12, @hnshah, @jatenner, @jeremyknows, @jeunessima, @johnybradshaw, @joshwilks111-max, @kkroo, @kyledeanjackson, @lubos-buracinsky, @lukejduncan, @mnuradli1, @mvanhorn, @navin-moorthy, @nezovskii, @p3ob7o, @panda850819, @rvdlaar, @sanaxr0001-tech, @seungsu-kr (legacy v0.31.3 stdio lifecycle), @sergeclaesen, @sharziki, @skalingclouds, @sliday, @SunOpt, @tkhattar14, @vincedk-alt, @yashkot007, @zzdisturbed.
+
+### Itemized changes
+
+#### Fixed
+
+- `src/commands/sync.ts` — Terraform / HCL extensions (`.tf`, `.tfvars`, `.hcl`) now in `CODE_EXTENSIONS`; previously invisible to `gbrain sync --strategy code`. Closes #878.
+- `src/commands/upgrade.ts` — `resolveBunGlobalRoot()` finds Bun's global install root via `$BUN_INSTALL` or `~/.bun/install/global`. Closes #1029. PR #1032.
+- `src/commands/config.ts` — `isSensitiveConfigKey()` + `redactConfigValue()` are the single source of truth for `show` and `set`; word-boundary regex avoids `monkey` false-positives. Closes #892.
+- `src/core/oauth-provider.ts` — `verifyAccessToken` throws `InvalidTokenError` on expired + invalid bearer; SDK middleware returns 401 not 500. Closes #935. PR #1012.
+- `src/commands/serve-http.ts` — `GET /mcp` returns 405 with `Allow: POST, DELETE` per MCP Streamable HTTP spec. PR #1076.
+- `src/commands/doctor.ts` — `resolveWhoknowsFixturePath()` walks from `import.meta.url` for source-repo signature; honors `GBRAIN_WHOKNOWS_FIXTURE_PATH` env override. Closes #969. PR #1034.
+- `src/commands/frontmatter.ts` + `src/core/brain-writer.ts` — `createFrontmatterBackup()` + `makeFrontmatterBackupRunId()`; backups land under `~/.gbrain/backups/frontmatter/`. Closes #902. PR #903.
+- `src/core/config.ts` — `path.isAbsolute()` and dual-separator `..` check for `GBRAIN_HOME` on Windows. Closes #1019. PR #1083.
+- `src/core/ai/gateway.ts` — `warnRecipesMissingBatchTokens()` filters to recipes whose provider id is referenced in `embedding_model` / `embedding_multimodal_model`. PR #1117.
+- `src/commands/sync.ts` — `hasOriginRemote()` probe; skip git pull when no `origin` remote. PR #1119.
+- `src/cli.ts` + `src/core/search/hybrid.ts` — `awaitPendingSearchCacheWrites()` drains in-flight cache writes before CLI exit. PR #1125.
+- `src/commands/backlinks.ts` — dedupe `(source, target)` pairs within a single source page. Closes #967. PR #967.
+- `src/core/cycle.ts` — backlinks phase runs in `check` mode during dream/autopilot. PR #1027.
+- `src/commands/autopilot.ts` — wrapper script sources `~/.zshenv` before `~/.zshrc`. PR #966.
+- `src/commands/apply-migrations.ts` — `process.exit(0)` on list / dry-run / up-to-date paths. PR #1062.
+- `src/commands/sync.ts` — `buildAutoEmbedArgs(slugs, sourceId)` threads `--source` to incremental auto-embed. PR #1120.
+- `src/cli.ts:parseOpArgs` — `--no-<key>` flips boolean param false; `query` op honors per-call `source_id` over `ctx.sourceId`. PR #1124.
+- `src/commands/doctor.ts` — `childTableOrphansCheck()` scans 10 FK columns across 8 tables for orphan rows; cascade-violation diagnostic with paste-ready cleanup SQL. Closes #1063. PR #1064.
+- `src/commands/autopilot.ts` + `src/core/cycle.ts` — autopilot trips circuit breaker only on `failed`; orphans phase uses ratio threshold (`count / total_pages > 0.5`) not absolute. PR #1113.
+- `src/core/ai/gateway.ts` — `embedSubBatch` validates response length AND per-embedding dim; partial responses throw before indexing. Closes #925. PR #926.
+- `src/commands/serve-http.ts` — admin register-client honors `grantTypes`, `redirectUris`, `tokenEndpointAuthMethod: 'none'` (PKCE public clients). PR #1077.
+- `src/core/cycle/extract-facts.ts` — `opts.slugs !== undefined` check; empty array is a no-op. Closes #1096.
+- `src/commands/serve-http.ts` + `src/admin-embedded.ts` + `scripts/build-admin-embedded.ts` + `scripts/check-admin-embedded.sh` — auto-generated manifest of admin/dist embedded via `with { type: 'file' }`; two-tier resolution (dev cwd vs binary). Closes #1090.
+- `test/source-id-routing.test.ts` — 6 PGLite regression cases for `importFromContent({sourceId})`. Locks in #891, #978, #1078.
+- `src/commands/migrations/v0_11_0.ts` + `src/commands/apply-migrations.ts` — Phase A routes in-process for PGLite; pre-flight schema-version warning skips PGLite. Closes #1100.
+- `src/commands/serve-http.ts` — `GBRAIN_ADMIN_BOOTSTRAP_TOKEN` env override with `^[A-Za-z0-9_-]{32,}$` validation; `--suppress-bootstrap-token` flag. Closes #1024.
+- `src/core/config.ts` — `migrateLegacyEmbeddingConfig()` translates legacy `provider` + `model` shape to `embedding_model: <provider>:<model>` with stderr nudge. Closes #1086.
+- `test/brain-writer.test.ts` — assertion updated for centralized backup path (CI green).
+
+#### Maintenance
+
+- `test/upgrade.serial.test.ts` — renamed from `upgrade.test.ts`; quarantined for `process.env` mutation pattern per the test-isolation lint. Follow-up: migrate to `withEnv()` helper.
+
+### What was already shipped on master (closed as duplicates)
+
+#### Phase 1 close pass — 22 PRs + 14 issues closed with thank-you comments
+
+- **Cluster A** (v0.35.3.0): 11 PRs + 6 issues all reporting `extract_facts.entity_hints` array-schema items missing. The shared `paramDefToSchema` mapper in `src/mcp/tool-defs.ts` is now the single source of truth across stdio MCP, HTTP MCP, and the subagent registry; `test/mcp-tool-defs.test.ts` enforces structurally. (#904, #907, #910, #979, #980, #999, #1028, #1043, #1049, #1057, #1084, #1103, #806, #831, #833, #911, #1042, #1048.)
+- **Cluster B** (v0.35.3.0): 3 PRs + 2 issues on `--no-recurse-submodules` flag placement. `GIT_SSRF_FLAGS` (global config, before verb) is now distinct from `GIT_SSRF_SUBCOMMAND_FLAGS` (subcommand flags, after verb); position-anchored regression guard in `test/git-remote.test.ts`. (#963, #985, #1020, #1023, #1104, #800, #813.)
+- **Cluster C** (v0.35.5.0): 3 PRs + 2 issues on `oauth_clients` bootstrap. `applyForwardReferenceBootstrap` covers `files.source_id`, `files.page_id`, `oauth_clients.source_id`, `oauth_clients.federated_read`, `sources.archived/_at/_expires_at` before SCHEMA_SQL replay. `test/schema-bootstrap-coverage.test.ts` parses migrate.ts at PR time and fails the suite if any `(table, column)` pair isn't covered. (#1017, #1045, #1115, #1116, #974, #1018, #1092.)
+- **Cluster D singletons**: orphans soft-delete (v0.35.5.0), doctor `node_modules` walker (v0.35.5.0 `pruneDir`), Voyage 2048d `output_dimension` (v0.33.1.1 PR #962), doctor stale verb names (v0.31.7). (#922, #1033, #799, #865, #835, #1021.)
+- **Cluster E troll**: #1114 closed and locked.
+- **PRs absorbed by structural fixes**: #1050 (doctor crash count — v0.35.5.0 `summarizeCrashes()`), #1054 (schema v44→v45 wedge — v0.35.5.0 bootstrap extension), #1065 (embed PGLite hang — v66 partial index).
+## [0.36.1.0] - 2026-05-17
+
+**The brain learns how you tend to be wrong, then argues against your blind spots on every advice call.**
+
+Hindsight-inspired calibration loop. Three new cycle phases, eight expansions, one big admin tab. gbrain stops being a smart database and starts being a mirror that knows your track record. The brain extracts gradeable claims from your prose, grades them against reality, aggregates your record into a calibration profile, and surfaces it everywhere advice gets given — `gbrain think --with-calibration` rewrites questions against your known biases, contradictions point at the bias pattern that produced them, real-time nudges fire when you commit a high-conviction take in a domain where you've been wrong before.
+
+### What you can now do
+
+**Run `gbrain calibration`** and see your own track record narrated in conversational voice: "You called early-stage tactics well — 8 of 10 held up. Geography is your blind spot — 4 of 6 missed." Not "Brier 0.18." Not "conviction-bucket 0.8-0.9." Friend-not-doctor by design, voice-gated against academic slop.
+
+**Run `gbrain think --with-calibration "should we hire fast in NY?"`** and the answer surfaces both your prior AND the counter-prior from your hedged-domain self. The bias filter applies to question framing, not evidence interpretation (D22 placement: AFTER retrieval, BEFORE the question). Off by default — flip it when you trust the profile.
+
+**Open the admin SPA Calibration tab** at `gbrain serve --http`'s `/admin` and see your Brier-trend sparkline, per-domain accuracy bars, pattern statements, and "you committed to these and never revisited" abandoned-threads card. Server-rendered SVG, zero new chart library dep, follows the existing Linear-calm-clarity admin design.
+
+**Commit a high-conviction take in a known-biased domain** and a conversational stderr nudge fires: "Hey — you just bet pretty hard on this NY tech thing (0.85). Last year you made three similar geographic calls; two of them missed. Maybe dial it back to a 0.65 hunch?" 14-day cooldown per pattern so you don't get re-nudged on the same call.
+
+**Run `gbrain calibration --undo-wave v0.36.1.0`** to fully reverse the wave's mutations. Every new row carries `wave_version='v0.36.1.0'`; the undo command reverts auto-applied take resolutions, deletes calibration profiles, purges nudge logs, optionally scrubs gstack-coupled learnings. Dry-run mode shows what would change before you commit.
+
+### Validated by published benchmarks
+
+**First published benchmark for AI memory systems that reason about user track records.** Sibling repo [gbrain-evals](https://github.com/garrytan/gbrain-evals) ships two new categories specifically gating this wave:
+
+- **cat14 — advice quality A/B.** `think --with-calibration` vs baseline on 8 hand-authored probes covering 6 calibration scenarios (relevant bias, confidence boost, empty profile, irrelevant bias, multi-bias, voice stress). First live run: **75% calibrated wins / 0% baseline wins / 25% tie**, voice gate **100%**, force-fit prevention **100%**.
+- **cat15 — propose_takes F1.** Extract-takes prompt against 48 hand-labeled claims across 8 synthetic pages covering 5 prose genres. First live run: **0.952 F1 training / 0.922 F1 holdout**, train-holdout gap **0.03** (no overfitting). The tuned prompt back-ports verbatim into this wave's `EXTRACT_TAKES_PROMPT`, replacing the v1 stub.
+
+The iteration log at `eval/data/cat14-calibration/iteration-log.md` documents three same-day prompt variants where the gate caught two regressions before either could ship. Full benchmark report: [2026-05-18 BrainBench Cat 14 + Cat 15 Calibration](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-18-brainbench-cat14-cat15-calibration.md). No prior published baseline exists in the personal-AI calibration-loop space; Hindsight introduced the concept as a skills demo without quantified evaluation. cat14 + cat15 stake out the category.
+
+Reproduction: ~$0.15 per full eval run (cat14 + cat15), under 5 minutes wallclock on Apple Silicon.
+
+### Itemized changes
+
+#### Three new cycle phases
+
+- **`propose_takes`** — LLM scans markdown prose, proposes gradeable claims to a review queue. Idempotency cache on `(source_id, page_slug, content_hash, prompt_version)` — unchanged pages never re-spend tokens. F2 fence-dedup: the LLM sees existing canonical takes and dedupes. v0.36.1.0 ships the tuned `v0.36.1.0-tuned-cat15` prompt (replaces the v1 stub) — validated at **0.922 F1 holdout** by the cat15 eval against the hand-labeled corpus at `test/fixtures/calibration/`.
+- **`grade_takes`** — walks unresolved takes older than 6 months, retrieves evidence, asks a judge model. Auto-resolve DISABLED by default (D17 — earn trust first); operator opts in via `cycle.grade_takes.auto_resolve.enabled: true`. Conservative threshold: confidence >= 0.95 single-model OR >= 0.85 with 3/3 ensemble unanimous. Ensemble tiebreaker (E2) reuses v0.27.x cross-modal-eval substrate; fires on borderline single-model verdicts (0.6-0.95 band).
+- **`calibration_profile`** — aggregates resolved takes into 2-4 narrative pattern statements + active bias tags. Voice-gated via shared `gateVoice()` (D24 — five surfaces, one function). Cold-brain branch: skips when <5 resolved takes. `grade_completion` field surfaces partial-grade state to the dashboard "60% graded" badge.
+
+#### Eight expansions
+
+- **E1** Anti-bias prompt rewrite at think time (cathedral moment — see "What you can now do").
+- **E2** Multi-judge ensemble grading (3-model parallel via Promise.allSettled, 3/3 unanimous required for auto-apply).
+- **E3** Calibration-aware contradictions — v0.32.6 probe + bias-tag join; outputs flag "this contradiction fits your over-confident-geography pattern."
+- **E4** Outcome-driven gstack-learnings coupling — incorrect auto-resolutions write to `~/.gstack/projects/<slug>/learnings.jsonl` so plan-ceo-review / ship / investigate skills pull calibration data. Config-gated (off for external users until gstack-API stabilizes).
+- **E5** Brier-trend forecasting on new takes — inline blurb at write time. Pure math over existing scorecards, no LLM.
+- **E6** Admin SPA Calibration tab with 4 server-rendered SVG charts (Brier trend, per-domain accuracy, abandoned threads, clickable pattern drill-downs).
+- **E7** Real-time pattern surfacing on sync — conversational nudges with 14-day cooldown via `take_nudge_log`.
+- **E8** Team-brain calibration sharing via mounts — asymmetric publish-opt-in (D15) + D18 cross-brain query semantics (4 rules, pinned by `test/cross-brain-calibration.test.ts`).
+
+#### Schema (6 new migrations)
+
+- v67 `calibration_profiles` — per-(source, holder) row with scorecard + narrative + bias tags + voice-gate audit.
+- v68 `take_proposals` — propose_takes queue with composite idempotency unique key.
+- v69 `take_grade_cache` — grade_takes verdict cache (composite PK on take + prompt_version + judge + evidence_signature).
+- v70 `take_nudge_log` — E7 cooldown state (polymorphic FK: take_id OR proposal_id).
+- v71 `takes_resolved_at_idx` — partial index for Brier-trend aggregation (CONCURRENTLY on Postgres, plain on PGLite).
+- v72 `think_ab_results` — D19 A/B harness data for `gbrain think --ab`.
+
+Every row carries `wave_version='v0.36.1.0'` so `--undo-wave` can reverse precisely.
+
+#### Architecture
+
+- `BaseCyclePhase` abstract class (D21) enforces source-scope threading, budget metering, error envelope, and progress-reporter integration at the type level. Forgetting `sourceScopeOpts(ctx)` becomes a compile error — closes the v0.34.1 leak class structurally for every new phase.
+- Voice gate (D11 + D24): single `gateVoice()` function, mode parameter drives surface-specific rubrics. 2 regenerations then hand-written template fallback. Audit columns persisted on `calibration_profiles` rows so the operator can spot voice-rubric drift.
+- Cross-brain query semantics (D18): 4 rules, hermetically tested. Subagent prohibition gates on `ctx.viaSubagent && !allowedSlugPrefixes` — closes the OAuth-token-to-cross-brain-leak escalation surface.
+
+#### New surfaces
+
+- CLI: `gbrain calibration`, `gbrain calibration --regenerate`, `gbrain calibration --undo-wave <version> [--dry-run] [--scrub-gstack]`, `gbrain calibration ab-report [--days N]`, `gbrain takes revisit <slug>`, `gbrain takes nudge --reset <id>`, `gbrain think --with-calibration`.
+- MCP op: `get_calibration_profile` (scope: read).
+- HTTP routes: `/admin/api/calibration/profile`, `/admin/api/calibration/charts/:type`, `/admin/api/calibration/pattern/:id`.
+- Doctor checks (4): `abandoned_threads`, `calibration_freshness`, `grade_confidence_drift` (CDX-11 mitigation), `voice_gate_health`.
+
+#### Privacy
+
+- `test/fixtures/calibration/` ships a synthetic corpus (5 representative pages across 5 genres) for extract-takes prompt tuning. Every page is anonymized per the CLAUDE.md placeholder list — no real names, no real funds, no real deals.
+- `scripts/check-synthetic-corpus-privacy.sh` (CDX-14 mitigation) is wired into `bun run verify`. Greps for explicit dollar amounts + verifies every non-essay fixture references at least one canonical placeholder. Fail-fast on accidental leakage.
+- E7 nudges route to STDERR only in v0.36.1.0; multi-channel routing (webhook, admin SPA toast) is a v0.37+ follow-up.
+
+#### Tests
+
+- 290+ new tests across 13 new test files. All hermetic (no real LLM, no PGLite contention).
+- IRON RULE regression suite in `test/regressions/v0.36.1.0-iron-rule.test.ts` pins R1-R5: think baseline unchanged, contradictions output unchanged, takes resolution flow independent of grade_takes, search/list_pages/get_page unchanged, search modes unchanged.
+
+#### Plan + review trail
+
+- `/plan-ceo-review` cleared SCOPE_EXPANSION mode with 19 decisions + 8 accepted expansions.
+- `/plan-eng-review` cleared with 9 findings + 21 implementation tasks across 5 lanes.
+- `/plan-design-review` cleared with mockup variant-B (Linear calm clarity) approved.
+- Codex outside-voice surfaced 18 findings; 5 spec bugs auto-fixed, 6 strategic tensions resolved via D17/D18/D19.
+- 30 decisions D1-D30 resolved with explicit user input. Plan persisted at `~/.claude/plans/system-instruction-you-are-working-rippling-knuth.md`.
+
+#### Design system
+
+- `DESIGN.md` at the repo root formalizes the de facto admin tokens that landed v0.26.0. Calibration target for future `/plan-design-review` and `/design-review`.
+- `--text-muted` bumped from #555 to #777 globally for WCAG AA contrast (was 4.0 — below the 4.5 floor; now ~5.5).
+
+## To take advantage of v0.36.1.0
+
+`gbrain upgrade` is all you need for the schema. Calibration data only accumulates as you use the brain.
+
+1. Run `gbrain upgrade`. Six migrations v67-v72 land.
+2. Build up resolved takes. The calibration profile needs >= 5 resolved takes before it generates anything. Resolve takes manually via `gbrain takes resolve N --quality correct|incorrect|partial` OR wait for grade_takes auto-grading (opt in via `gbrain config set cycle.grade_takes.auto_resolve.enabled true`).
+3. Run a dream cycle: `gbrain dream` (or wait for autopilot). The new phases run in this order: propose_takes → grade_takes → calibration_profile.
+4. Read the profile: `gbrain calibration`.
+5. Try anti-bias think: `gbrain think --with-calibration "<your question>"`.
+6. Open the admin SPA: `gbrain serve --http` → /admin → Calibration tab.
+7. To roll back the entire wave: `gbrain calibration --undo-wave v0.36.1.0 --dry-run` first to see what would change, then drop `--dry-run`.
+8. If anything looks wrong, file an issue: https://github.com/garrytan/gbrain/issues with `gbrain doctor` output and which step broke.
+
+## [0.36.0.0] - 2026-05-17
+
+**Skillpacks are scaffolding now, not amber. Scaffold once, own the files, fork freely.**
+
+GBrain v0.36 retires the managed-block install model. `gbrain skillpack install` and `uninstall` are gone — replaced by `scaffold` (one-time additive copy), `reference` (read-only diff lens against gbrain's bundle), `migrate-fence` (one-shot transition from the old fence), `scrub-legacy-fence-rows` (opt-in row cleanup), and `harvest` (lift a proven skill from a host repo back into gbrain). The whole "amber" surface — managed block, cumulative-slugs receipt, content-hash gates, lockfile, prune semantics — is deleted. ~600 LOC of mechanism comes out; ~400 LOC of new modules + ~1000 LOC of new test coverage replace it. The point is that scaffolded skills are first-class members of your agent repo. You own them. gbrain becomes a reference library, not a package manager.
+
+### What you can now do
+
+**Scaffold a skill into your real agent repo and own it outright.** `cd ~/git/PR #1137 author && gbrain skillpack scaffold book-mirror` copies the skill markdown, any sibling routing-eval fixtures, and any paired source files declared in the skill's frontmatter `sources:` array. No managed-block fence written to your `RESOLVER.md`. No `cumulative-slugs` receipt. No `.gbrain-skillpack.lock` file. The files are yours. Edit freely; re-scaffolding refuses to overwrite anything that exists.
+
+**Read the diff against gbrain's bundle as reference, not as a force-update.** `gbrain skillpack reference book-mirror` prints per-file status (`identical` / `differs` / `missing`) plus unified diffs for any drift, framed with an agent-readable header: "These files live at <path> as reference. Read them and decide what (if anything) to integrate into your local skills/. Your local edits are intentional — do not blindly overwrite." For a one-line-per-skill sweep, `reference --all`. For two-way auto-apply of non-conflicting hunks, `reference <name> --apply-clean-hunks` (with a documented two-way merge limitation — no scaffold-time base tracking, by design).
+
+**Migrate off the old managed block with one command.** `gbrain skillpack migrate-fence` strips `<!-- gbrain:skillpack:begin -->` / `end -->` markers and the manifest receipt comment from your resolver file, preserving every row inside the fence verbatim as user-owned routing. Cumulative-slugs receipt missing or stale → falls back to row-parsing with a loud warning. Idempotent; re-runs are no-ops. Once your agent confirms it walks frontmatter `triggers:` for routing, `gbrain skillpack scrub-legacy-fence-rows` tears down the bridge — removes legacy rows whose skill exists AND declares non-empty triggers, preserves anything user-added.
+
+**Lift a proven skill back into gbrain so other clients can scaffold it.** `gbrain skillpack harvest my-skill --from ~/git/PR #1137 author` is the inverse loop. Reads the host skill's `skills/<slug>/` + any paired source files, copies into gbrain's tree, updates `openclaw.plugin.json` (sorted), and runs a default-on privacy linter against `~/.gbrain/harvest-private-patterns.txt` (built-in defaults catch `\bPR #1137 author\b`, common email regex, Slack channel patterns). Any match → rollback (delete the copy) and exit non-zero so the editorial pass surfaces the leak. Symlinks in the host skill dir are rejected; canonical-path containment prevents path traversal. The companion editorial skill `skillpack-harvest` walks the genericization checklist (scrub fork names, generalize triggers, lift fork-specific conventions to references).
+
+**Gate CI on bundle drift without breaking interactive use.** `gbrain skillpack check` defaults to informational (exit 0 even with drift) when invoked as a subcommand. Pass `--strict` to opt into exit-1 on action-needed for CI gating. Top-level `gbrain skillpack-check` (the cron entry point) keeps its existing exit-1 behavior for backwards compat.
+
+**Auto-detect a target workspace in non-OpenClaw repos.** `autoDetectSkillsDir` gains a `cwd_walk_up` tier ahead of the `~/.openclaw/workspace` fallback. `cd ~/git/PR #1137 author && gbrain skillpack scaffold ...` finds PR #1137 author automatically. `$OPENCLAW_WORKSPACE` precedence preserved when explicitly set — the precedence regression (R5) is pinned by a test.
+
+### Migration
+
+Existing pre-v0.36 installs:
+
+```bash
+gbrain skillpack migrate-fence       # one-shot, strips the fence
+# (after confirming your agent walks frontmatter)
+gbrain skillpack scrub-legacy-fence-rows
+```
+
+Scripts referencing `gbrain skillpack install` or `gbrain skillpack uninstall` will exit non-zero with a hint pointing at the replacement command. There's no deprecated alias — this is a clean break. Update the scripts once and move on. The bundled skill markdown + paired source files are yours to edit; cleanup is `rm -rf skills/<slug>/` (consult the skill's frontmatter `sources:` for any paired files to remove alongside).
+
+### For contributors
+
+Major file/test surface changes:
+- New: `src/core/skillpack/{copy,scaffold,reference,migrate-fence,scrub-legacy,harvest,harvest-lint,apply-hunks,diff-text}.ts`
+- New: `skills/skillpack-harvest/SKILL.md` (the editorial workflow companion to the harvest CLI)
+- New: `test/skillpack-{copy,scaffold,reference,reference-apply,apply-hunks,migrate-fence,scrub-legacy,harvest,harvest-lint,frontmatter-sources}.test.ts` and `test/e2e/skillpack-flow.test.ts` (~140 cases)
+- Deleted: `test/skillpack-uninstall.test.ts` (412 lines), `test/skillpack-sync-guard.test.ts`
+- Extended: `src/core/skillpack/bundle.ts` (frontmatter `sources:` validation, `enumerateScaffoldEntries`), `src/core/repo-root.ts` (`cwd_walk_up` tier)
+- New docs: `docs/guides/skillpacks-as-scaffolding.md` (model + workflow)
+- `src/core/skillpack/installer.ts` and `test/skillpack-install.test.ts` survive for now — the v0.32 `gbrain skillpack diff` informational command still uses `diffSkill` from there. Slated for deletion in v0.37 cleanup.
+
+## [0.35.8.0] - 2026-05-17
+
+**Phantom unprefixed entity pages drain automatically on the next autopilot cycle. Your `alice.md` residue gets folded into `people/alice-example.md` with embeddings + strikethrough state preserved, no operator action needed.**
+
+The cleanup half of PR #1010 (which shipped the three preventive layers that stopped NEW phantoms). The original `gbrain merge-phantoms` command was scrapped after 30 codex rounds because it duplicated `extract_facts` reconciliation logic in a parallel implementation. This release does the same job by folding the redirect into the existing cycle phase with two NEW lossless primitives. Capped at 50 phantoms per cycle (configurable) so a brain with hundreds of phantoms drains over a handful of cycles without stalling any one of them.
+
+### The phantom-pile numbers that matter
+
+On a brain with a known historical phantom pile, the autopilot cycle now reports three new counters in `CycleReport.totals`. The shape of one real cycle on a representative test corpus:
+
+| Counter                       | Meaning                                                                | Run 1 | Run 2 |
+|-------------------------------|------------------------------------------------------------------------|-------|-------|
+| `phantoms_redirected`         | Phantoms successfully migrated to canonical                            | 50    | 0     |
+| `phantoms_ambiguous`          | Phantoms skipped because canonical was multi-candidate (operator triage) | 0     | 0     |
+| `phantoms_skipped_drift`      | Phantoms skipped because disk fence ≠ DB body                          | 0     | 0     |
+
+Run 1 caps at the per-cycle limit. Run 2 is a clean no-op because phantoms 1–50 are now soft-deleted (deleted_at filter excludes them from the predicate). For a 200-phantom brain you'd see 50/50/50/50 across four cycles.
+
+### What you can now do
+
+**Find your `alice.md` already folded into `people/alice-example.md` after the next autopilot cycle.** Pre-v0.35.6, gbrain would create phantom pages at the brain root whenever an entity name fell through the resolver chain (e.g. fuzzy match scored below 0.4 on `"Alice"` because pg_trgm hates short bare names). PR #1010 stopped new phantoms via prefix-expansion + stub-guard + dropped-fact audit. This release drains the existing pile: the next cycle's `extract_facts` phase walks unprefixed-slug pages, resolves each to its canonical via a phantom-specific resolver that bypasses exact-self-match, migrates fact rows via a new DB-level UPDATE that preserves every column (embedding, validUntil, strikethrough/forgotten state, supersession metadata, source_session, confidence), merges the disk fence with dedup-guarded row_num continuation, refreshes `content_hash` so the next `gbrain sync` sees the canonical as unchanged, rewrites links table FKs, soft-deletes the phantom, and unlinks the `.md` file. All in one bounded pass per cycle. Backlinks via `[[alice]]` in markdown bodies still point at the original phantom slug — wiki-link text rewrite is a follow-up because it requires editing every other markdown file's body.
+
+**Preview the cleanup before committing it.** `gbrain dream --phase extract_facts --dry-run` runs the full predicate + resolver + drift-check chain and reports counters, but writes nothing to FS or DB or the audit log. Same dryRun knob `extract_facts` already had — no new flags to learn.
+
+**Tune the per-cycle cap if your brain has thousands of phantoms.** `GBRAIN_PHANTOM_REDIRECT_LIMIT=200 gbrain dream --phase extract_facts` overrides the default 50. Trade-off is cycle latency: each phantom takes ~10–20 DB queries and one disk write, so 200 phantoms is ~5s of work plus the once-per-cycle lock acquisition. The cap exists because `extract_facts` is part of every autopilot cycle and we don't want a single cycle to stall on a one-time cleanup.
+
+**Triage ambiguous phantoms via the new audit log.** When a phantom like `alice` matches BOTH `people/alice-example` AND `people/alice-other`, the redirect refuses to guess. The audit log entry at `~/.gbrain/audit/phantoms-YYYY-Www.jsonl` records `outcome: ambiguous` with the full candidate list (slug + connection_count) so an operator can review and decide. ISO-week-rotated; honors `GBRAIN_AUDIT_DIR` for container deployments.
+
+### Itemized changes
+
+#### New engine surface
+- `BrainEngine.refreshPageBody(slug, sourceId, compiled_truth, timeline, content_hash)` — narrow UPDATE of three columns + updated_at. Skips soft-deleted rows. Implemented on Postgres + PGLite with parity tests.
+- `BrainEngine.migrateFactsToCanonical(phantomSlug, canonicalSlug, sourceId)` — DB-level UPDATE that rewrites `entity_slug` + `source_markdown_slug` on active fact rows, preserving every other column. Returns `{migrated: number}`. Idempotent (re-run returns 0). Skips expired rows so the supersession audit trail stays intact.
+
+#### New resolver primitives
+- `resolvePhantomCanonical(engine, sourceId, phantomSlug)` (exported from `src/core/entities/resolve.ts`) — fuzzy + prefix-expansion path, skips the exact-slug match step that made the original redesign attempt a no-op (the phantom slug exact-matches itself). Returns the resolved canonical (must contain `/`) or null.
+- `findPrefixCandidates(engine, sourceId, token)` (exported same file) — standalone SQL query returning ALL candidates across configured directories, NOT just per-directory top-1. Used by the ambiguity gate. Cap of 10. Returns rows ordered by connection_count DESC, slug ASC.
+
+#### New orchestrator
+- `src/core/cycle/phantom-redirect.ts` — `runPhantomRedirectPass` + `tryRedirectPhantom`. The per-cycle pass acquires `gbrain-sync` writer lock once at start (30s bounded retry), walks up-to-`GBRAIN_PHANTOM_REDIRECT_LIMIT` unprefixed slugs, handles each, releases lock. Per-phantom flow: body-shape gate (strict zero-residue) → resolve canonical → ambiguity check → bi-directional drift check → dry-run early exit → materialize canonical .md if DB-only → append phantom fence rows to canonical's fence (dedup-guarded by claim+valid_from) → refreshPageBody → migrateFactsToCanonical → rewriteLinks → softDeletePage → unlink phantom .md. Touched canonicals returned to caller so the main reconcile loop derives their DB facts from the merged fence.
+- `src/core/facts/phantom-audit.ts` — JSONL audit at `~/.gbrain/audit/phantoms-YYYY-Www.jsonl` with ISO-week rotation. Honors `GBRAIN_AUDIT_DIR`. Best-effort writes (failures logged to stderr, never throw).
+
+#### Cycle wiring
+- `runPhaseExtractFacts(engine, brainDir, sourceId, dryRun, changedSlugs?)` — new signature threads sourceId via `resolveSourceForDir(engine, brainDir)` so multi-source brains route the redirect pass correctly.
+- `runExtractFacts` opts gain `brainDir?: string`. When provided, the phantom pre-pass runs after the legacy-row guard and before the main reconcile loop. The main loop's slug set is UNIONed with `touched_canonicals` so canonical pages get reconciled from the merged disk fence in the same cycle (the round-14 risk specialized to incremental mode).
+- Three new `CycleReport.totals` keys: `phantoms_redirected`, `phantoms_ambiguous`, `phantoms_skipped_drift`. Schema-additive, `schema_version` stays 1.
+- Two extract_facts result fields surface to phase details: `phantoms_lock_busy`, `phantoms_more_pending`. Daily report can flag "lock was contended this cycle — try again later" and "50/N phantoms processed, N-50 pending next cycle."
+
+#### Codex outside-voice findings (all 12 incorporated pre-implementation)
+The original /plan-eng-review proposed reusing `writeFactsToFence` for the migration. Codex caught seven blockers + five risks in pre-implementation review, including: `resolveEntitySlug` exact-self-matches the phantom slug → main path would be a no-op; `writeFactsToFence` is append-only-with-new-row-numbers and drops embeddings + supersession state; `rewriteLinks` rewrites DB FK only (wiki-link text in compiled_truth stays); raw-`compiled_truth` materialization produces malformed `.md` (no frontmatter); the narrow `refreshPageBody` left `content_hash` stale so sync would re-import the canonical defeating the no-op-second-cycle premise; per-phantom 30s lock × 50 cap = 25min worst-case stall; `runPhaseExtractFacts` didn't pass sourceId so multi-source cleanup wouldn't fire. The shipping design addresses all twelve.
+
+#### Known limitations (follow-up TODOs)
+- **Wiki-link text rewrite**: `[[alice]]` references in other pages' markdown bodies still point at the phantom slug. Manual operator command in a future PR. Preventive resolver in PR #1010 ensures new writes go to canonical, so this is a one-time historical concern.
+- **Unified write-path lock**: `gbrain-sync` serializes the redirect vs `performSync` but doesn't cover MCP `put_page`, the facts queue, or direct `writeFactsToFence`. A future design pass will widen the lock scope; the current design is best-effort serialization, not a hard contract.
+
+#### Tests
+- `test/phantom-redirect.test.ts` — 38 hermetic PGLite unit cases covering all 12 codex findings, all 8 cascade-table regression rounds (9, 12, 14, 17, 19/20, 22, 27/29/30, 2-P1), and the Section 1/2/4 decision points (A1 incremental-mode, A2 lock contract, A3 body-shape gate, C1 phantom-DB-wipe, C4 lock retry, P1 per-cycle cap, D5 ambiguity audit, D10 dry-run, D12 phantom-first order).
+- `test/phantom-redirect-engine-parity.test.ts` — 6 cases asserting `refreshPageBody` + `migrateFactsToCanonical` produce byte-equivalent results on PGLite and Postgres (deleted_at filter, source_id scope, metadata preservation, idempotency, expired-row skip).
+- `test/e2e/phantom-redirect.test.ts` — 4 real-Postgres E2E cases: bulk-pile cycle with cap=50, steady-state no-op, concurrent-sync lock-busy seal, postgres-js text-string embedding survives migration (round-12 pin).
+
+## To take advantage of v0.35.8.0
+
+`gbrain upgrade` will automatically pick up the new logic. The phantom-redirect pass fires on the very next `extract_facts` phase — autopilot cycles, manual `gbrain dream`, anything that walks the phase.
+
+1. **Preview the cleanup first** (recommended on brains with many phantoms):
+   ```bash
+   gbrain dream --phase extract_facts --dry-run --dir /path/to/brain
+   ```
+   The output's `phantoms_redirected` counter shows how many would be folded. No DB or FS changes occur in dry-run.
+
+2. **Run the real pass:**
+   ```bash
+   gbrain dream --phase extract_facts --dir /path/to/brain
+   ```
+
+3. **Inspect the audit log:**
+   ```bash
+   cat ~/.gbrain/audit/phantoms-$(date +%Y-W%V).jsonl
+   ```
+   One line per phantom decision. `outcome: redirected` has `canonical_slug` + `fact_count`. `outcome: ambiguous` lists the candidate slugs so you can manually pick one (move the phantom's body content under the correct canonical, delete the phantom .md, run sync).
+
+4. **For very large piles**, raise the per-cycle cap:
+   ```bash
+   GBRAIN_PHANTOM_REDIRECT_LIMIT=200 gbrain dream --phase extract_facts --dir /path/to/brain
+   ```
+
+5. **If `gbrain doctor` warns** about anything after the redirect, please file an issue at https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/audit/phantoms-*.jsonl`
+   - which step looks wrong
+
+## [0.35.7.0] - 2026-05-17
+
+**The contradiction probe grew up. Typed claims over time, regressions detected automatically, founder scorecards as a one-liner.**
+
+v0.35.3.1 taught the probe to see dates. v0.35.7 turns dates into a proper time-series substrate. Your `## Facts` fences can now carry typed metric assertions (mrr=50000, arr=2000000, team_size=12), the consolidate cycle phase writes `valid_until` on chronologically-superseded facts, and two new commands turn that data into operator signal: `gbrain eval trajectory <entity>` shows the sorted claim history with regressions flagged inline, and `gbrain founder scorecard <entity>` rolls up claim accuracy, consistency, growth direction, and red flags into one JSON payload.
+
+This is the wave the original temporal-contradiction RFC deferred to "Phases 2-4." Three rounds of review (CEO, eng, codex outside-voice) caught a security regression in the planned API, a pre-existing cycle-idempotency bug that would have poisoned trajectory data on every dream cycle re-run, and a misidentified file path for the LLM extraction prompt — all fixed before any code landed.
+
+### What you can now do
+
+**Author typed metric claims in the `## Facts` fence.** The fence widens from 10 to 14 columns when a row carries `claim_metric`, `claim_value`, `claim_unit`, `claim_period`. Mixed fences (some typed rows, some not) work fine — the renderer stays at 10 cells when every row's typed fields are empty, so existing brains don't see diff churn. Metric labels normalize to lowercase snake_case (`MRR` → `mrr`, `Monthly Recurring Revenue` → `mrr`) so trajectory queries don't fragment across capitalization variants. Fifteen common founder metrics have canonical names in the seed map; unknown labels lowercase + underscore-collapse and pass through.
+
+**Get chronological metric trajectories on any entity.** `gbrain eval trajectory companies/acme-example` prints a sorted history with auto-detected regressions flagged inline. `--metric mrr` filters to a single metric. `--since 2026-01-01 --until 2026-07-31` narrows the window. `--json` returns the stable `schema_version: 1` envelope `{points, regressions, drift_score, schema_version}`. Regression threshold is 10% by default, override via `GBRAIN_TRAJECTORY_REGRESSION_THRESHOLD`. The drift_score is `1 - mean(cosine(emb[i], emb[i-1]))` over the trajectory's existing embeddings: 0 means narrative stable, 1 means every claim is unrelated; null when fewer than 3 typed points have embeddings.
+
+**Roll up an entity into a founder scorecard.** `gbrain founder scorecard companies/acme-example` produces four signals: claim_accuracy (over resolved takes), consistency (1 minus the fraction of metric value-changes), growth_trajectory (direction + delta per metric), and red_flags (regressions + high drift + missed predictions). `--json` for a stable contract that any downstream system can consume. Default window is the last year; `--since` / `--until` to narrow.
+
+**Reach trajectories via the MCP `find_trajectory` op** — read scope, not localOnly. OAuth clients query other agents' brains directly. Visibility filtering matches `recall`'s posture: remote callers see only `visibility='world'` facts; local CLI sees everything. Source-scoped via the existing `sourceScopeOpts` v0.34.1.0 pattern — federated `allowedSources` clients get the union; scalar `sourceId` clients see their one source.
+
+**Run the dream cycle without poisoning trajectory data.** v0.35.7 fixes a pre-existing cycle idempotency bug: before this wave, running the full cycle twice in a row would append duplicate takes via `MAX(row_num)+1` after `extract_facts` wiped `consolidated_at` on every fact. The fix is a semantic upsert keyed on `(page_id, claim, since_date)` so re-promotion of a stable cluster reuses the existing take. The autopilot can now run on a cron without silently doubling your facts table's promotion count.
+
+**Cycle-inserted facts now arrive with embeddings.** Before this wave, the `extract_facts` cycle phase inserted fence-derived facts with `embedding = NULL`, which broke consolidate's cosine clustering and any downstream embedding-dependent feature (drift score, semantic similarity in recall). v0.35.7 batches `gateway.embed()` after fence parse and threads embeddings into `insertFacts`. ~$0.02 per 1K facts at OpenAI 3-large pricing; falls open when the embedding gateway is unavailable.
+
+**Fact valid_from now reflects claim dates, not import timestamps.** Eng review caught that `extractFactsFromFenceText` returned `valid_from: undefined` when a fence row lacked an explicit `validFrom:`, which fell through to `insertFacts`'s `now()` default. So a meeting page dated 2026-04-28 used to land its facts as claimed-on-today instead of claimed-on-the-meeting-date — and every trajectory query against existing fences showed import dates instead of claim dates. The fix threads `pages.effective_date` (v0.29.1+) as the fallback. Precedence chain: explicit fence `validFrom:` > `pages.effective_date` > `now()`.
+
+### Itemized changes
+
+- **Schema migration v67** (`facts_typed_claim_columns`) adds four optional columns to `facts`: `claim_metric TEXT`, `claim_value DOUBLE PRECISION`, `claim_unit TEXT`, `claim_period TEXT`. Plus partial index `facts_typed_claim_idx ON facts (entity_slug, claim_metric, valid_from) WHERE claim_metric IS NOT NULL`. All nullable; metadata-only on both engines.
+- `ParsedFact` (`src/core/facts-fence.ts`) gains optional `claimMetric`, `claimValue`, `claimUnit`, `claimPeriod`. Parser tolerates both 10-cell (legacy) and 14-cell (widened) row shapes. Renderer emits 14 cells iff any row has a non-undefined typed field; otherwise stays at 10-cell for backward compat. Numeric `claimValue` cell tolerates comma thousand separators (`50,000` → `50000`).
+- `extractFactsFromFenceText` (`src/core/facts/extract-from-fence.ts`) gains optional `pageEffectiveDate` in opts. Three-branch precedence: fence row > pageEffectiveDate > undefined (engine defaults to `now()`). Metric normalization via `normalizeMetricLabel` with a 15-entry seed map for common founder metrics.
+- `src/core/facts/extract.ts` (the MCP put_page / backstop Haiku call site, NOT the cycle phase — Codex F2 fix) extends its system prompt to optionally emit `metric/value/unit/period` for metric-shaped claims. Backward compatible — non-metric claims emit nulls.
+- `NewFact` interface (`src/core/engine.ts`) gains `claim_metric`, `claim_value`, `claim_unit`, `claim_period` (all nullable). Postgres + PGLite `insertFact` / `insertFacts` SQL extended.
+- `BrainEngine.findTrajectory` method added to both engines. Source-scoped (`sourceId` scalar fast path + `sourceIds` federated array), visibility-filtered when `remote=true`. Single SQL query, `ORDER BY valid_from ASC, id ASC` for deterministic ordering (R3 pin).
+- `src/core/trajectory.ts` (new file) — pure functions `detectRegressions`, `computeDriftScore`, `computeTrajectoryStats`. Exported `TRAJECTORY_SCHEMA_VERSION = 1`. Threshold knob via `GBRAIN_TRAJECTORY_REGRESSION_THRESHOLD` env var.
+- `find_trajectory` MCP op (`src/core/operations.ts`) — scope: read, not localOnly. Routes through `sourceScopeOpts(ctx)` + threads `ctx.remote` for visibility filtering. Strips raw `Float32Array` embeddings from the wire response.
+- `gbrain eval trajectory <entity>` CLI (`src/commands/eval-trajectory.ts`). Pure data fn + JSON formatter + human formatter + thin-client routing seam.
+- `gbrain founder scorecard <entity>` CLI (`src/commands/founder-scorecard.ts`). Pure aggregation function `computeFounderScorecard` exported for tests. Thin-client routing falls back to trajectory-only when remote.
+- `consolidate` cycle phase (`src/core/cycle/phases/consolidate.ts`) gains semantic upsert keyed on `(page_id, claim, since_date)` + chronological `valid_until` writeback on each cluster. Re-running the full cycle on stable input produces zero new takes (R7 pin) and zero `valid_until` diffs (idempotent).
+- `extract_facts` cycle phase (`src/core/cycle/extract-facts.ts`) batch-embeds via `gateway.embed()` before `insertFacts`. Threads `page.effective_date` as the `pageEffectiveDate` fallback.
+- New tests: `test/facts-fence-typed.test.ts` (17 cases — round-trip, normalization, valid_from precedence), `test/consolidate-valid-until.test.ts` (4 cases — R4a chronological writeback, R4b/R7 cycle idempotency), `test/engine-find-trajectory.test.ts` (18 cases — engine + trajectory.ts pure functions), `test/operations-find-trajectory.test.ts` (9 cases — MCP op shape + visibility + source scoping), `test/eval-trajectory.test.ts` (7 cases — CLI), `test/founder-scorecard.test.ts` (9 cases — rollup math), `test/eval-contradictions/no-valid-until-write.test.ts` (4 cases — R1+R8 grep guards).
+- Migration v67 test added to `test/migrate.test.ts` (6 cases — shape, source-shape, idempotency, runtime materialization, backward compat with nullable columns).
+
+## To take advantage of v0.35.7.0
+
+`gbrain upgrade` should do this automatically. The wave ships migration v67 (`facts_typed_claim_columns`); `apply-migrations` runs it transparently.
+
+1. **Verify the migration applied:**
+   ```bash
+   gbrain doctor --json
+   ```
+   Look for `schema_version: 67`. If it's still lower, run `gbrain apply-migrations --yes`.
+2. **Try the new commands on an existing entity:**
+   ```bash
+   gbrain eval trajectory <some-entity-slug>
+   gbrain founder scorecard <some-entity-slug>
+   ```
+   Without any typed-claim data yet, `eval trajectory` will say "(no typed claims for this entity in the window)". That's normal — the substrate is now ready; the data lands as you author typed fence rows or as the next dream cycle's Haiku extraction populates them on conversation-derived facts.
+3. **Author a typed-claim fence row (optional):**
+   In any entity's `## Facts` fence, extend a row with typed columns:
+   ```markdown
+   | # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context | claim_metric | claim_value | claim_unit | claim_period |
+   |---|-------|------|------------|------------|------------|------------|-------------|--------|---------|--------------|-------------|------------|--------------|
+   | 1 | MRR hit $50K | fact | 1.0 | private | high | 2026-01-15 |  | OH transcript |  | mrr | 50000 | USD | monthly |
+   ```
+   On next `gbrain sync` + dream cycle, the fact lands with typed fields. `gbrain eval trajectory` picks it up immediately.
+4. **(Optional) Tighten the regression threshold:**
+   ```bash
+   export GBRAIN_TRAJECTORY_REGRESSION_THRESHOLD=0.05   # fire on 5%+ drops instead of 10%
+   ```
+5. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+## [0.35.6.0] - 2026-05-17
+
+**Your search results stop letting weak pages climb to the top just because they have a lot of links pointing at them.** Off by default; turn it on with one config key.
+
+Here's the problem this fixes. When your agent searches your brain, gbrain ranks pages by how well they match the query, then it gives a small bonus to pages that have lots of inbound links, pages you write about often, and pages you touched recently. Those bonuses are small individually. But on a big brain indexed with a strong embedding model (the kind shipped in v0.35.0.0 with ZeroEntropy zembed-1, or anyone running OpenAI text-embedding-3-large or Voyage 3+), the strong embedder treats "topically adjacent" content as more similar than it really is. So a page that barely matches your query still lands in the candidate pool, picks up all three bonuses, and ends up ranked higher than the page that actually answers your question.
+
+The fix is a "floor." When you turn it on, gbrain only gives the metadata bonuses to pages near the top of the result list. Pages way down the list (far from the best match) get NO bonus, no matter how popular or important they are by other measures. So a weak match stays weak. A strong match stays on top.
+
+Built on a community contribution from @jayzalowitz (he runs gbrain inside [SkyTwin](https://github.com/jayzalowitz/skytwin), a twin-memory layer, and noticed the bug on his own labeled test set). His PR was #1091. We did a deep review, found a few correctness bugs, refactored the shape, and shipped the integrated version. Full credit on the commit.
+
+### How to turn it on
+
+```bash
+# Try it on a single query first:
+gbrain query "..." --floor-ratio 0.85
+
+# Once you're happy, make it the default for every search:
+gbrain config set search.floor_ratio 0.85
+```
+
+`0.85` means "only boost pages that scored at least 85% as well as the best match." Good starting value if you're using a modern embedding model. Try `0.90` or `0.95` if you want the boost to apply to an even smaller head of the list. Values outside `0` to `1` are ignored, so a typo can't break your search.
+
+Off by default. We can't prove it helps on every brain (the original bug came from one specific test corpus), so we want you to opt in and tell us how it goes before we make it the default.
+
+### What you'd see in a concrete example
+
+Imagine you search "best meeting notes from Q1" and the brain returns:
+
+| Page | Match quality | Has many backlinks? | Without the floor | With the floor (0.85) |
+|---|---|---|---|---|
+| `meetings/q1-strategy-offsite` (the actual answer) | strong | no | bonus skipped, ranks lower | wins, ranks first |
+| `people/some-popular-person` (barely matches the query) | weak (0.5x of the top match) | yes, 1000 backlinks | huge bonus, leapfrogs the meeting note | no bonus (below the floor), stays where it should |
+
+That second row is the bug you've maybe been hitting if your brain has a few "celebrity" pages that everyone links to.
+
+### What's safe to know about
+
+Three things to keep in mind:
+
+- **Your search cache will dip for a few minutes after the upgrade, then recover.** gbrain caches recent search results to make repeat queries fast. We had to change the cache key shape so it can tell "floor on" results apart from "floor off" results. While both versions are running side by side during a deploy, the cache rebuilds. Clears itself within the cache TTL (default 1 hour).
+- **The gate only changes the three "metadata" bonuses (backlinks, salience, recency).** It does NOT change the exact-match bonus (when your query text literally appears in a page). Exact-match is a different kind of signal and stays on for everyone.
+- **No environment variable.** If you want to set this brain-wide, use `gbrain config set search.floor_ratio 0.85`. We deliberately did not add a `GBRAIN_SEARCH_FLOOR_RATIO` env var so `gbrain search modes` doesn't end up lying to you about what's actually configured.
+
+### What we caught and fixed before merging
+
+A second-opinion review (we sent the diff to a different AI for an adversarial read) caught three real bugs the original PR shipped with:
+
+- **Cache could serve stale "no-floor" results to a "with-floor" caller.** Same shape as a bug we fixed in v0.32.3 for the other search knobs. Closed.
+- **Pages with broken scores (NaN, comes up if an embedder version drift slipped through) would have skipped the floor and gotten boosted anyway.** Now they skip the boost entirely, which is the safer default.
+- **If your search returned only negative-score results (unusual but possible), the floor would have rejected its own top match.** Now it just turns off the floor in that case.
+
+We also reshaped two things from the original PR:
+
+- **The floor is now computed once per search, not three times.** The original recomputed it at each bonus stage, which meant the order the bonuses ran in subtly changed which pages got gated out. Now it's one number, applied the same way to all three.
+- **You can set it three ways instead of one.** Per-query (`--floor-ratio` flag), per-brain (config key, shown in `gbrain search modes`), or eventually per-mode bundle (the three search modes will get defaults once we have data on what works).
+
+### Itemized changes
+
+- `src/core/search/hybrid.ts` — three boost functions (`applyBacklinkBoost`, `applySalienceBoost`, `applyRecencyBoost`) gain an optional `floorThreshold?: number` parameter. Per-result loops now skip non-finite (NaN/Infinity) scores AND scores below the threshold. New exported `computeFloorThreshold(results, floorRatio)` is the single ratio→threshold converter; it returns `Number.NEGATIVE_INFINITY` (no gate) for undefined floorRatio, out-of-range values, or inputs with no positive signal. `runPostFusionStages` computes the threshold ONCE at entry and passes it uniformly to all three stages. `PostFusionOpts.floorRatio?: number` is the public-facing ratio.
+- `src/core/search/mode.ts` — `ModeBundle.floor_ratio: number | undefined`. All three bundles set `floor_ratio: undefined` initially. `SearchKeyOverrides` and `SearchPerCallOpts` gain `floor_ratio?: number`. `resolveSearchMode` picks via the standard chain. `loadOverridesFromConfig` parses `search.floor_ratio` (validates 0..1 range; out-of-range silently drops). `SEARCH_MODE_CONFIG_KEYS` includes `'search.floor_ratio'`. `KNOBS_HASH_VERSION` bumped 2→3; `knobsHash()` appends a `fr=<value-or-none>` segment at 4-decimal precision so 0.85, 0.851, and undefined all key into different rows.
+- `src/core/types.ts` — `SearchOpts.floorRatio?: number`.
+- `src/commands/search.ts` — `KNOB_DESCRIPTIONS` and the dashboard knob iteration include `floor_ratio`, so `gbrain search modes` and `gbrain search modes --json` surface the resolved value + source attribution alongside the other knobs.
+- `test/search.test.ts` — 30+ new cases covering `computeFloorThreshold` (out-of-range, NaN, negative top, all-NaN, single result), `applyBacklinkBoost` floor gate (preservation, weak-gated, borderline-eligible, leapfrog regression, NaN skip-not-pass), `applySalienceBoost` floor gate (T6 IRON RULE parity), `applyRecencyBoost` floor gate (T6 IRON RULE regression — the modified function shipped with zero test coverage on the new param), and `runPostFusionStages` single-baseline composition (D6 pin against future single-floor refactor).
+- `test/search-mode.test.ts` — `floor_ratio: undefined` added to the canonical-bundle fixtures for all three modes; `KNOBS_HASH_VERSION` pin updated to 3; new tests for `floor_ratio`-changes-hash (cache contamination prevention); `loadOverridesFromConfig` coverage for valid and out-of-range values.
+- `test/search/knobs-hash-reranker.test.ts` — header comment + version assertion updated for the 2→3 bump.
+
+### What's NOT in scope (deferred)
+
+- **Default-on for any mode.** `MODE_BUNDLES.floor_ratio` stays `undefined` for conservative / balanced / tokenmax until per-corpus ablation against gbrain's own eval surfaces (`longmemeval`, `whoknows`, `suspected-contradictions`, BrainBench-Real) backs a default flip. See `TODOS.md`.
+- **Per-stage floor ratios.** Single ratio applied uniformly to all three stages today. Different ratio per stage (different floor for salience vs recency) is v0.36+ if evidence shows asymmetric value.
+- **Per-source floor.** Single global threshold today. Federated-read users (v0.34.1.0+) sharing a query across multiple sources get one floor across the merged result set. v0.36+ if real federated-read usage shows the suppression issue codex flagged.
+- **Exact-match boost gating.** Explicit scope narrowing — exact-match is a lexical signal, different in kind from metadata boosts.
+- **`GBRAIN_SEARCH_FLOOR_RATIO` env var.** Would create a hidden side door `resolveSearchMode()` can't see. Use the config key instead.
+
+### For contributors
+
+- Plan + cross-model review trail: `~/.claude/plans/swift-sniffing-nygaard.md` captures the 9-decision (D1-D9) review pass through `/plan-eng-review` and `/codex`. Three correctness bugs (cache contamination, NaN passes gate, negative-top breaks single-result) were caught by codex's outside voice; two prior eng-review recommendations (per-stage composition lock, env var) were reversed before implementation. Reading the plan is the fastest way to understand which architectural decisions are durable vs accidental.
+- Community PR attribution: @jayzalowitz (PR #1091, SkyTwin twin-memory layer). The empirical motivation, the failure-mode framing, the dense-embedder targeting, and the `0.85` starting value are all from his ablation. Integration shape is gbrain-side.
+
+## To take advantage of v0.35.6.0
+
+`gbrain upgrade` should do this automatically. If it didn't:
+
+1. **Run the orchestrator manually** (no-op if migrations already at HEAD; the knobsHash bump is a code-level constant, not a DB schema change):
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the new knob is wired:**
+   ```bash
+   gbrain search modes --json | grep -A 1 floor_ratio
+   ```
+   Should show `"floor_ratio"` in the resolved knob map with `value: null` (no override set).
+3. **Try the gate on a corpus you suspect of leapfrog regressions:**
+   ```bash
+   # Compare results with and without the gate; if your dense-embedder corpus
+   # exhibits the failure mode, gate=0.85 should restore the strong primary.
+   gbrain query "..." --floor-ratio 0.85
+   ```
+4. **If `gbrain doctor` flags any new sync_failures or schema warnings post-upgrade,** the floor-ratio path is not the cause (no schema change in this release). File the issue at https://github.com/garrytan/gbrain/issues with `gbrain doctor` output.
+
+## [0.35.5.1] - 2026-05-16
+
+**`gbrain doctor` stops counting clean supervisor exits as crashes — the "120x/24h" alarm finally reflects real crashes, with per-cause breakdown for operator triage.**
+
+`doctor.ts:1013` and `gbrain jobs supervisor status` at `jobs.ts:805` both counted every `worker_exited` audit event as a crash, regardless of cause. After v0.34.3.0's RSS-watchdog work added more code=0 worker drains, the count inflated to 120+/day on a healthy brain — the exact alarm pattern users started seeing ("Supervisor crashes: 120x/24h, was 62x — nearly doubled"). The classifier upstream in `child-worker-supervisor.ts:309-321` was already stamping a five-value `likely_cause` field on every exit (clean_exit, graceful_shutdown, runtime_error, oom_or_external_kill, unknown); neither read site looked at it. v0.35.5.1 ships a shared `summarizeCrashes(events)` helper colocated with `readSupervisorEvents`, denylist semantics so future failure modes surface by default, threshold dropped from `>3` to `>=1`, and per-cause breakdown in the messages so an operator triages in one glance.
+
+**Relationship to v0.35.4.0:** that release shipped a binary `classifyWorkerExit({code})` helper (clean if `code === 0`, crash otherwise). It correctly stopped counting RSS-watchdog drains as crashes, but treated SIGTERM-driven graceful shutdowns as crashes (because `null !== 0`) and lost the cause distinction operators need to triage. v0.35.5.1 layers on top: reads `likely_cause` so `graceful_shutdown` is correctly clean, and bucketizes real crashes into `runtime_error` (code bugs), `oom_or_external_kill` (memory pressure), `unknown` (other), `legacy` (pre-v0.34 or future unrecognized). The `classifyWorkerExit` helper from v0.35.4.0 remains in use by the supervisor's internal restart policy where the binary check is the right shape; the doctor + jobs surfaces use the richer classifier.
+
+### What you can now do
+
+**Trust the doctor's supervisor count.** `gbrain doctor` reports actual crashes, not RSS-watchdog drains or SIGTERM stops. The "120x/24h" alarm class is dead.
+
+**See per-cause breakdown at a glance.** The warn message reads `Worker crashed Nx in last 24h (runtime=A oom=B unknown=C legacy=D)` — distinguishes memory pressure (oom) from code bugs (runtime) without grep'ing the JSONL audit.
+
+**Hook `crashes_by_cause` into monitoring.** `gbrain jobs supervisor status --json` now exposes `crashes_by_cause: {runtime_error, oom_or_external_kill, unknown, legacy}` and `clean_exits_24h` fields. Dashboards bind to named buckets.
+
+**Future failure modes surface by default.** Denylist semantics: only `clean_exit` and `graceful_shutdown` are non-crashes; everything else (including new `likely_cause` values added upstream in future releases) counts as a crash. The bug we just fixed cannot silently recur on the next schema addition.
+
+### Itemized changes
+
+- `src/core/minions/handlers/supervisor-audit.ts` exports new `isCrashExit(event)`, `summarizeCrashes(events)`, `CrashSummary` type, and `CLEAN_EXIT_CAUSES` constant. Single regression point — both CLI surfaces import from here so they cannot drift.
+- `src/commands/doctor.ts:1011-1043` replaces the ad-hoc `events.filter(e => e.event === 'worker_exited').length` with `summarizeCrashes(events)`. Drops the warn threshold from `>3` to `>=1` (any real crash is signal now that the counter is calibrated). Widens the ok message with `clean_exits_24h=N` and the warn message with `runtime=N oom=M unknown=K legacy=L`.
+- `src/commands/jobs.ts:803-826` same wiring. JSON output adds `crashes_by_cause` and `clean_exits_24h` fields. Human output gains a per-cause line under `Crashes (24h)` plus a `Clean exits (24h)` line.
+- `test/supervisor-audit.test.ts` (new) — 14 unit cases: 9-case `isCrashExit` branch matrix (every `likely_cause` value, denylist regression guard for unrecognized future causes, legacy fallback paths for pre-v0.34 entries, non-exit-event defensive case), 5-case `summarizeCrashes` aggregator (mixed-stream bucket assertions, empty input, non-exit-only, unrecognized-cause routing to legacy, null-code edge case).
+- `test/doctor.test.ts` — 4 source-grep wiring assertions guarding both surfaces against drift: doctor + jobs.ts use `summarizeCrashes`, the ad-hoc filter pattern is gone, threshold is `>=1`, per-cause breakdown substrings (`runtime=`, `oom=`, `unknown=`, `legacy=`, `clean_exits_24h=`, `crashes_by_cause`) appear in both files.
+- Why denylist semantics (codex outside-voice catch during `/plan-eng-review`): the set of clean-exit causes is small and explicit (the worker exited because we asked it to); the set of crash causes is open-ended. Allowlist would silently underreport future failure modes; denylist surfaces them by default. The bug being fixed today is itself an allowlist-of-event-names — the denylist shape forecloses the recurrence.
+- Plan + review trail: `/plan-eng-review` cleared the plan with 3 substantive findings resolved (shared helper extraction, denylist over allowlist, threshold rebaseline pulled into scope). Codex outside-voice surfaced the duplicate bug at `jobs.ts:805` (would have shipped doctor-only otherwise and let the two surfaces drift). Coverage audit reports 100% on the 22 logical branches the diff introduces. Adversarial review surfaced 13 follow-up observations, all either pre-existing surfaces or accepted plan trade-offs — none in-scope for this PR.
+
+## To take advantage of v0.35.5.1
+
+`gbrain upgrade` is all you need. No schema migration, no config change, no manual action.
+
+1. Run `gbrain upgrade`.
+2. Verify the count:
+   ```bash
+   gbrain doctor 2>&1 | grep -i supervisor
+   gbrain jobs supervisor status --json | jq '{crashes_24h, clean_exits_24h, crashes_by_cause}'
+   ```
+   Both commands MUST report identical `crashes_24h` (cross-surface parity is the regression guard). If the new count is still high, the watchdog OOMs / SIGKILLs are real — investigate via `~/.gbrain/audit/supervisor-*.jsonl` or check the per-cause breakdown in the warn message.
+3. Cross-check with raw JSONL if you want ground truth:
+   ```bash
+   jq -r 'select(.event=="worker_exited") | .likely_cause' ~/.gbrain/audit/supervisor-*.jsonl | sort | uniq -c
+   ```
+4. If anything looks wrong, file an issue: https://github.com/garrytan/gbrain/issues with the doctor output and the relevant lines from the audit JSONL.
+
+## [0.35.5.0] - 2026-05-16
+
+**Upgrade goes through on stuck Supabase brains. Orphan counts get honest. `gbrain think` over MCP actually answers. Worktrees stop being misclassified. node_modules stops leaking.**
+
+A correctness wave. Five user-visible bugs closed; one structural CI guard added so the bootstrap class can't bite the same shape again. The shape of the change: `applyForwardReferenceBootstrap` now probes for seven previously-missing columns (files.source_id/page_id, oauth_clients.source_id/federated_read, sources.archived/archived_at/archive_expires_at) AND runs on the same DDL connection that holds the advisory lock, `findOrphanPages` filters soft-deleted pages on BOTH the candidate side AND the link-source side, `runThink` routes through `gateway.chat()` so the API key configured via `gbrain config set` actually reaches MCP stdio launches, `manageGitignore` distinguishes worktrees from submodules via Git's documented `/modules/` vs `/worktrees/` path segments, and walkers in `extract.ts` + `transcript-discovery.ts` consult a new `pruneDir()` helper at descent time so they don't recurse into vendor directories.
+
+### What you can now do
+
+**Upgrade gbrain cleanly on Supabase brains stuck at pre-v0.18, pre-v0.26.5, or pre-v0.34 schemas.** The bootstrap forward-reference class (eleven incidents in two years per the test file's own comment block) loses its largest remaining lineage. Pre-v0.18 brains had `files` without `source_id`/`page_id`, so the `idx_files_source_id` index creation crashed before any migration could run. Pre-v0.26.5 brains had `sources` without the archive lifecycle columns (`archived`, `archived_at`, `archive_expires_at`), but `CREATE TABLE IF NOT EXISTS sources` is a no-op on existing tables so the schema-blob replay couldn't add them — every downstream visibility filter in search/list_pages tripped. Pre-v0.34 brains had `oauth_clients` without the source-scoping columns (`source_id` FK, `federated_read` GIN-indexed array) so the v60+v61+v65 chain failed the same way. All seven columns now have explicit `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` probes in both engines. **And the probes now run on the DDL connection that holds the advisory lock** — pre-fix they ran through the instance pool while the lock sat on a different connection, opening a concurrent-bootstrap race for anyone on Supabase's transaction pooler. Codex caught that during pre-landing review.
+
+**Trust orphan counts again.** `gbrain orphans` filtered nothing on `deleted_at` — soft-deleted pages (v0.26.5 soft-delete shipped without updating this query) appeared as orphans, inflating counts. Worse, links from soft-deleted source pages still counted as inbound, so a live page could hide from orphan results purely because a deleted page linked to it. The query now filters BOTH sides: `p.deleted_at IS NULL` on the candidate, `src.deleted_at IS NULL` on the inbound-link JOIN. The structural correctness rule for soft-delete (active relationships only) lands the same shape across both engines.
+
+**`gbrain think` answers over MCP when you've set the key via `gbrain config`.** Before this release, MCP stdio launches (Claude Desktop, Cursor, etc.) returned `(no LLM available — set ANTHROPIC_API_KEY or pass client)` regardless of whether `gbrain config set anthropic_api_key sk-...` had been run, because `runThink` instantiated `new Anthropic()` directly and the Anthropic SDK only reads `process.env.ANTHROPIC_API_KEY`. Stdio launches from desktop apps don't inherit shell env, so the gbrain-config-set key never reached the SDK. `runThink` now routes through `gateway.chat()` — the canonical AI seam per CLAUDE.md that v0.31.12 established for chat/embed/expansion. The gateway reads `anthropic_api_key` from `~/.gbrain/config.json` AND from env, so both paths work. Existing `opts.client` injection is preserved (the test seam stays unchanged); `opts.stubResponse` continues to bypass the LLM call entirely. When neither the key nor a client is available, the graceful "no LLM available" stub still fires with the same `NO_ANTHROPIC_API_KEY` warning — the legacy diagnostic signal lives.
+
+**Use gbrain inside Conductor worktrees without `.gitignore` management silently breaking.** `manageGitignore` (the storage-tiering helper that updates `.gitignore` to exclude `db_only:` paths) treated every `.git`-as-file as a submodule and skipped management. Both submodules AND worktrees use `.git` as a file (worktrees just have a different file content). The discriminator now matches the gitdir path segment: `/modules/<name>` = submodule, `/worktrees/<name>` = worktree. Worktrees are first-class repos and now get `.gitignore` management. Handles all four combinations of {relative, absolute} × {modules, worktrees} including the absorbed-submodule case from `git submodule absorbgitdirs` that the legacy absolute-vs-relative discriminator would have misclassified.
+
+**Walkers stop wasting IO on `node_modules` (and frontmatter scans stop emitting false MISSING_OPEN warnings from inside vendor packages).** The canonical `isSyncable` filter had only a dot-prefix exclusion — `.git` and `.obsidian` were blocked but `node_modules` slipped through (no leading dot). A new `pruneDir()` helper centralizes the directory-exclusion logic at single-segment granularity: blocks `node_modules`, dot-prefix dirs, `ops`, and `*.raw` sidecars. Both walkers (`walkMarkdownFiles` in extract.ts, `listTextFiles` in transcript-discovery.ts) consult it at descent time BEFORE recursing, so the IO cost of walking thousands of vendor files is saved. `isSyncable` itself also gains node_modules exclusion — verified blast radius across every existing caller (sync, frontmatter, brain-writer, import) confirms node_modules exclusion was already the desired behavior. `transcript-discovery` also moves from non-recursive to recursive walking with the same pruneDir guard, so transcripts in nested corpus subdirectories (`corpus/2026/...`) become discoverable.
+
+### Itemized changes
+
+#### Closed issues
+- **#1018** PGLite upgrade wedge: applyForwardReferenceBootstrap missing v60 oauth_clients forward refs
+- **#974** Bootstrap gap: applyForwardReferenceBootstrap misses files.source_id + files.page_id
+- **#820** v0.13.0 migration files.page_id forward-reference cascade on pre-v0.18 brains
+- **#1021** orphans: soft-deleted pages still counted in orphan scan
+- **#952** think over MCP returns "no LLM available" even when ANTHROPIC_API_KEY configured via gbrain config
+- **#889** Git worktrees misclassified as submodules — breaks .gitignore management on Conductor workflows
+- **#923** gbrain frontmatter validate walks node_modules, inflating MISSING_OPEN counts in doctor
+- **#202** extract --source fs walker does not respect isSyncable prefix exclusions
+
+#### Bootstrap structural fix
+- Seven new probes in `applyForwardReferenceBootstrap` (both engines): `files.source_id`, `files.page_id`, `oauth_clients.source_id`, `oauth_clients.federated_read`, `sources.archived`, `sources.archived_at`, `sources.archive_expires_at`.
+- Bootstrap now accepts the DDL connection from `initSchema` and runs probes inside the advisory-lock scope (Codex pre-landing review P1).
+- New MIGRATIONS-source introspection contract test in `test/schema-bootstrap-coverage.test.ts`: parses `src/core/migrate.ts` for every `ALTER TABLE ... ADD COLUMN`, asserts each (table, column) pair is covered by the bootstrap OR by the schema blob's CREATE TABLE bodies. Catches the column-only forward-reference class (sources.archived* shape) that the pre-existing CREATE INDEX parser couldn't see. Source-text introspection covers all three migration shapes: top-level `sql:`, `sqlFor.{postgres,pglite}` overrides, and handler-body `engine.runMigration(N, \`ALTER TABLE ...\`)`.
+- Pre-existing parser bug in `parseBaseTableColumns` fixed: now strips SQL line comments (`-- ...`) and block comments (`/* ... */`) before identifying column names. Pre-fix, any column preceded by a comment line inside the CREATE TABLE body was silently dropped (e.g. `page_kind`, `deleted_at`, `emotional_weight`, `effective_date` — all dropped from coverage).
+
+#### Walker correctness
+- New exported `pruneDir(name: string): boolean` helper in `src/core/sync.ts`. Blocks `node_modules`, dot-prefix directories, `ops`, and `*.raw` sidecars.
+- `isSyncable` now applies `pruneDir` per path segment (legacy dot-prefix + `.raw/` + `ops/` checks consolidated).
+- `walkMarkdownFiles` (extract.ts) consults `pruneDir` at descent + uses `isSyncable({strategy: 'markdown'})` at file emit. Pre-fix the walker had ad-hoc dot-prefix exclusion and didn't call isSyncable at all.
+- `listTextFiles` (transcript-discovery.ts) now recursive with `pruneDir`-guarded descent. Uses its own `.txt`/`.md` predicate rather than the markdown-strategy isSyncable that would have rejected `.txt` and applied markdown-only README/ops exclusions.
+
+#### Soft-delete correctness
+- `findOrphanPages` (both engines) filters `p.deleted_at IS NULL` on the candidate side AND adds `JOIN pages src ON src.id = l.from_page_id WHERE src.deleted_at IS NULL` to the EXISTS subquery on the link-source side.
+
+#### MCP think gateway routing
+- `runThink` (`src/core/think/index.ts`) drops the direct `new Anthropic()` instantiation. New `tryBuildGatewayClient` probes recipe availability + ANTHROPIC_API_KEY presence (reads BOTH `process.env` and `loadConfig()`'s gbrain config). Returns null on miss, preserving the legacy graceful-degradation path.
+- New `chatResultToMessage` adapter converts gateway's `ChatResult` to an Anthropic-Message-shaped object. `mapStopReason` translates provider-neutral stop reasons (`end` / `length` / `tool_calls` / `refusal` / `content_filter` / `other`) to Anthropic's `stop_reason` enum.
+
+#### Git worktree discriminator
+- `manageGitignore` (`src/commands/sync.ts`) reads the `.git` file content and matches the gitdir path segment: `/modules/<name>` → skip (submodule, parent-managed), `/worktrees/<name>` → MANAGE (worktree, first-class repo). Malformed `.git` file (no `gitdir:` prefix, IO error) defaults to MANAGE preserving pre-fix catch{} semantics.
+
+#### Tests
+- `test/helpers/extract-added-columns.ts` (NEW): MIGRATIONS source introspection helper with internal test seam for the regex.
+- `test/schema-bootstrap-coverage.test.ts`: extended `REQUIRED_BOOTSTRAP_COVERAGE` with 7 new entries + 4 new test cases (MIGRATIONS contract, sanity check, regex shape variants, planted-bug regression).
+- `test/orphans.test.ts`: 3 new cases pinning the both-sides soft-delete filter — soft-deleted candidate excluded, codex C11 link-source case, live-link smoke regression.
+- `test/think-gateway-adapter.test.ts` (NEW): 9 cases covering response-shape conversion, stop-reason mapping, model-id normalization (bare + prefixed), unknown-provider fallback, no-API-key fallback, hasAnthropicKey env read.
+- `test/storage-sync.test.ts`: 5 new cases for worktree/submodule discrimination (relative + absolute × modules + worktrees, malformed `.git` file).
+- `test/sync.test.ts`: 7 new isSyncable + 6 new pruneDir cases including the node_modules CRITICAL regression.
+
+#### Critical files
+- `src/core/{pglite,postgres}-engine.ts` — `applyForwardReferenceBootstrap` (extended; Postgres engine threads DDL connection); `findOrphanPages` (both sides filter).
+- `src/core/think/index.ts` — gateway adapter + ThinkLLMClient backward compat.
+- `src/core/sync.ts` — new `pruneDir` export; `isSyncable` per-segment pruning.
+- `src/commands/{extract,sync}.ts` — walker pruneDir adoption; worktree discriminator.
+- `src/core/cycle/transcript-discovery.ts` — recursive walker with pruneDir.
+- `test/helpers/extract-added-columns.ts` — NEW.
+- `test/schema-bootstrap-coverage.test.ts` — extended.
+
+#### Follow-ups filed
+- `TODOS.md`: runThink full rewrite to drop ThinkLLMClient indirection now that the gateway adapter is in place. Supabase parity test fixture for the bootstrap connection-threading (the bug is fixed; the test fixture proving it under real pooler topology is the residual).
+
+## To take advantage of v0.35.5.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration on a pre-v0.18 / pre-v0.26.5 / pre-v0.34 brain:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the bootstrap landed:**
+   ```bash
+   gbrain doctor --json | grep -E 'schema_version|bootstrap'
+   ```
+3. **Confirm the new columns exist on Supabase brains** (the wave's primary target):
+   ```bash
+   psql "$DATABASE_URL" -c "\d sources" | grep -E 'archived|archive_expires_at'
+   psql "$DATABASE_URL" -c "\d files" | grep -E 'source_id|page_id'
+   psql "$DATABASE_URL" -c "\d oauth_clients" | grep -E 'source_id|federated_read'
+   ```
+4. **If `gbrain think` was returning "no LLM available" over MCP** despite a configured key, no manual action needed — the gateway adapter activates as soon as v0.35.5.0 is installed.
+5. **If any step fails**, file an issue with the output of `gbrain doctor` and contents of `~/.gbrain/upgrade-errors.jsonl` at https://github.com/garrytan/gbrain/issues.
+
 ## [0.35.4.0] - 2026-05-16
 
 **Doctor stops crying wolf on clean worker restarts. Entity resolver stops spawning phantom pages. Prefix-expansion gets 58x faster.**
@@ -62,7 +3923,7 @@ The judge now sees the page-level `effective_date` for each chunk via a `(from: 
 
 **Cap the cost of the post-bump re-judge.** The `PROMPT_VERSION` change invalidates the entire judge cache (the prompt shape changed, old verdicts no longer apply). Before that re-judge spends any tokens, the runner prints an upper-bound cost estimate and waits 10 seconds in TTY for Ctrl-C; set `GBRAIN_NO_PROBE_PROMPT=1` to skip or `GBRAIN_PROBE_PROMPT_GRACE_SECONDS=0` to proceed immediately. Non-TTY (autopilot) auto-proceeds with a stderr note. `--budget-usd N` hard-caps the run when cumulative cost exceeds the cap. The judge model now resolves through `models.eval.contradictions_judge` (defaults to Haiku tier), so `gbrain config set models.eval.contradictions_judge` works the same way as every other model config key. `gbrain models doctor` surfaces the new touchpoint.
 
-**Block PII in `docs/proposals/*.md` at CI time.** A new `scripts/check-proposal-pii.sh` (wired into `bun run verify` and `bun run check:all`) catches the specific PII classes that surfaced in past RFC drafts: private repo references (`garrytan/brain`), personal-relationship vocabulary (`trial separation`, `couples session`, `divorce attorney`, etc.), death-context phrases, and the literal `Wintermute` agent name. Bare common words (`separation`, `funeral`) are intentionally not banned. The denylist names patterns rather than real names, so the script's own source doesn't re-introduce PII into the repo.
+**Block PII in `docs/proposals/*.md` at CI time.** A new `scripts/check-proposal-pii.sh` (wired into `bun run verify` and `bun run check:all`) catches the specific PII classes that surfaced in past RFC drafts: private repo references (`garrytan/brain`), personal-relationship vocabulary (`trial separation`, `couples session`, `divorce attorney`, etc.), death-context phrases, and the literal `PR #1137 author` agent name. Bare common words (`separation`, `funeral`) are intentionally not banned. The denylist names patterns rather than real names, so the script's own source doesn't re-introduce PII into the repo.
 
 ### Itemized changes
 
@@ -76,7 +3937,7 @@ The judge now sees the page-level `effective_date` for each chunk via a `(from: 
 - `date-filter.ts`: `shouldSkipForDateMismatch` accepts optional `effectiveDateA` and `effectiveDateB`. When both are non-null, returns `skip=false` with new `'both_have_effective_date'` reason. Other rules preserved.
 - `src/commands/eval-suspected-contradictions.ts`: new `--budget-usd N` hard cap (was pre-existing for runtime; help text now explains it), new cost-estimate prompt wired via `src/core/eval-contradictions/cost-prompt.ts`. `--severity` accepts `info`. `--severity` output shows `[verdict]` tag. Judge model routes through `resolveModel({configKey: 'models.eval.contradictions_judge', tier: 'utility', envVar: 'GBRAIN_CONTRADICTIONS_JUDGE_MODEL'})`. Human summary and trend chart show the per-verdict breakdown.
 - `src/commands/models.ts` registers `models.eval.contradictions_judge` as a tracked per-task model key so `gbrain models` and `gbrain models doctor` surface it.
-- `scripts/check-proposal-pii.sh` + denylist (structural patterns only, no real names) + 15-case test in `test/scripts/check-proposal-pii.test.ts`. Wired into `bun run verify`, `bun run check:all`, and as the new `bun run check:proposal-pii` standalone target. Two privacy-guard test fixtures naming `Wintermute` allowlisted in `scripts/check-test-real-names.sh`; the new privacy-guard scripts themselves allowlisted in `scripts/check-privacy.sh`.
+- `scripts/check-proposal-pii.sh` + denylist (structural patterns only, no real names) + 15-case test in `test/scripts/check-proposal-pii.test.ts`. Wired into `bun run verify`, `bun run check:all`, and as the new `bun run check:proposal-pii` standalone target. Two privacy-guard test fixtures naming `PR #1137 author` allowlisted in `scripts/check-test-real-names.sh`; the new privacy-guard scripts themselves allowlisted in `scripts/check-privacy.sh`.
 - Six IRON-RULE regression test suites pin the wave's invariants: R1 date-filter rule 3 relaxation preserves rules 1+2 (6 cases), R2 cache invalidation on `PROMPT_VERSION` bump, R3 verdict-enum migration (compile-time via `tsc --noEmit`), R4 runner emit predicate fires for every non-`no_contradiction` verdict (6 cases), R5 cache key tuple stays 5 fields, R6 contradiction severity unchanged (4 cases). Plus 9 cases on the cost-prompt helper.
 - The source RFC (`docs/proposals/temporal-contradiction-probe.md`) and PR title/body/commit/branch-name all scrubbed of PII at draft time. The new CI lint prevents the next one from slipping through.
 
@@ -1561,7 +5422,7 @@ The bigger swing (chunk-level `revises` field + ranking change + synthesize-prom
 **Time, place, and what you're doing — reinjected on every turn, no matter how hard the session got compacted.**
 **A new OpenClaw context engine that kills the "time warp" bug class with zero LLM calls and <5ms overhead.**
 
-When a long session compacts, the LLM loses track of what time it is, where Garry is, and what he's working on. The headline incident: Wintermute responded to a Sunday-night photo as if it were Monday morning, and reported Pacific Time while Garry was in Toronto. Both are downstream of the same architectural gap — compaction discards live state, and there was no mechanism to put it back.
+When a long session compacts, the LLM loses track of what time it is, where Garry is, and what he's working on. The headline incident: PR #1137 author responded to a Sunday-night photo as if it were Monday morning, and reported Pacific Time while Garry was in Toronto. Both are downstream of the same architectural gap — compaction discards live state, and there was no mechanism to put it back.
 
 v0.32.5 ships `gbrain-context`, an OpenClaw plugin that owns the `systemPromptAddition` slot on every `assemble()` call. It reads `memory/heartbeat-state.json`, `memory/upcoming-flights.json`, `memory/calendar-cache.json`, and `ops/tasks.md` from the agent workspace, and injects a structured block: current local time + day-of-week (computed from the location's timezone, not hardcoded US/Pacific), current city + country, home time when traveling, active flight + route when in transit, the meeting Garry is in right now, the next three calendar events within a 4-hour window, and unchecked tasks under "Today." Compaction can be as aggressive as it wants — the next turn rebuilds the block from disk in under 5ms.
 
@@ -2681,7 +6542,7 @@ Tests: 4570 unit pass / 1 pre-existing master flake (`BrainRegistry — lazy ini
 **Thin-client mode actually works now. `gbrain init --mcp-only` is no longer a half-built bridge.**
 **Every read + write + admin op routes through MCP; refused commands carry pinpoint hints.**
 
-Hermes/Neuromancer hit this in production: thin-client install of wintermute (102k pages,
+Hermes/Neuromancer hit this in production: thin-client install of PR #1137 author (102k pages,
 265k chunks). Every CLI search returned zero rows. Exit code 0. No warning. The agent
 configured `gbrain init --mcp-only`, then walked into a wall of "no results found" against
 a brain that had everything it needed. The CLI was opening the empty local PGLite,
@@ -2750,7 +6611,7 @@ warns about the new `oauth_client_scopes_probe` check:
    gbrain stats
    ```
    Both should now show real numbers and an identity banner like
-   `[thin-client → wintermute:3131 · brain: 102k pages, 265k chunks · v0.31.1]`.
+   `[thin-client → PR #1137 author:3131 · brain: 102k pages, 265k chunks · v0.31.1]`.
 
 4. **If any step fails or the numbers look wrong**, file an issue at
    https://github.com/garrytan/gbrain/issues with `gbrain remote doctor` output.
@@ -2977,7 +6838,7 @@ PGLite test (CI default) and a Postgres parity test
 
 The v0.30 dream cycle has been stalled since May 2 for one user — daily aggregated transcripts at 2.7-4.5MB each generate 1.7M-token Anthropic prompts, which hit the 1M-token hard limit and 400. The subagent handler treated those failures as renewable, so every doomed transcript stalled three times before dead-lettering, and every new cycle re-discovered and re-submitted the same fat transcripts. Six days of synth backlog, queue full of doomed work.
 
-v0.30.2 adds model-aware chunking + terminal-error classification + a poison-pill-free skip path. Wintermute's [PR #748](https://github.com/garrytan/gbrain/pull/748) supplied the boundary heuristics (`## Topic:` → `---` → `\n` ladder) and the `dream.synthesize.max_prompt_tokens` config surface. Garry's branch extended that with model-aware budgets, deterministic chunk identity for partial-progress safety, orchestrator-side slug rewriting for zero Sonnet trust on collisions, and doctor-surface visibility.
+v0.30.2 adds model-aware chunking + terminal-error classification + a poison-pill-free skip path. PR #1137's [PR #748](https://github.com/garrytan/gbrain/pull/748) supplied the boundary heuristics (`## Topic:` → `---` → `\n` ladder) and the `dream.synthesize.max_prompt_tokens` config surface. Garry's branch extended that with model-aware budgets, deterministic chunk identity for partial-progress safety, orchestrator-side slug rewriting for zero Sonnet trust on collisions, and doctor-surface visibility.
 
 ### What you can now do
 
@@ -3448,7 +7309,7 @@ path mirroring `gbrain reindex-code`.
    https://github.com/garrytan/gbrain/issues
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-Co-Authored-By: Wintermute <wintermute@garrytan.com>
+Co-Authored-By: PR #1137 author <PR #1137 author@garrytan.com>
 
 ## [0.29.0] - 2026-05-03
 
@@ -5276,7 +9137,7 @@ If you're a contributor:
 - The privacy gate (`scripts/check-privacy.sh`) was previously only in the now-removed `bun run test` chain. It now runs via `bun run verify` and CI's `.github/workflows/test.yml` calls `bun run verify` directly — single source of truth for "what's the ship gate."
 
 #### CI tightening
-- **`.github/workflows/test.yml`** now runs `bun run verify` (was: 4 specific scripts inlined). Privacy check now actually fires on every CI run; previously it ran only when somebody manually invoked `bun run test`. The pre-existing `Wintermute` references in `src/core/mounts-cache.ts:6` and `:324` (introduced in earlier commits and surviving every CI green) were caught by the now-firing gate and replaced with `your OpenClaw` per the privacy rule.
+- **`.github/workflows/test.yml`** now runs `bun run verify` (was: 4 specific scripts inlined). Privacy check now actually fires on every CI run; previously it ran only when somebody manually invoked `bun run test`. The pre-existing `PR #1137 author` references in `src/core/mounts-cache.ts:6` and `:324` (introduced in earlier commits and surviving every CI green) were caught by the now-firing gate and replaced with `your OpenClaw` per the privacy rule.
 
 #### Failure-first logging
 - **`.context/test-failures.log`** — extracted failure blocks per shard, prefixed with `--- shard N: <test name> ---`. Cleared at the start of every wrapper run. Falls back to `/tmp/gbrain-test-failures.log` if `.context/` is unwritable.

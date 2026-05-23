@@ -6,7 +6,6 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { MinionQueue } from '../core/minions/queue.ts';
 import { MinionWorker } from '../core/minions/worker.ts';
-import { classifyWorkerExit } from '../core/minions/exit-classification.ts';
 import type { MinionJob, MinionJobStatus } from '../core/minions/types.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
@@ -127,6 +126,8 @@ USAGE
                             [--backoff-type fixed|exponential] [--backoff-delay Nms]
                             [--backoff-jitter 0..1] [--timeout-ms Nms]
                             [--idempotency-key K] [--queue Q] [--dry-run]
+                            [--redact-secrets]   (shell only; scrubs inherit
+                                                  values from stdout/stderr)
   gbrain jobs list [--status S] [--queue Q] [--limit N]
   gbrain jobs get <id>
   gbrain jobs cancel <id>
@@ -238,6 +239,12 @@ HANDLER TYPES (built in)
       const queueName = parseFlag(args, '--queue') ?? 'default';
       const dryRun = hasFlag(args, '--dry-run');
       const follow = hasFlag(args, '--follow');
+      // v0.36.5.0: --redact-secrets is a CLI convenience that merges
+      // `redact_secrets: true` into the params before validation. Equivalent
+      // to passing it in --params JSON; flag form is faster to type.
+      if (hasFlag(args, '--redact-secrets') && name.trim() === 'shell') {
+        data.redact_secrets = true;
+      }
 
       if (dryRun) {
         console.log(`[DRY RUN] Would submit job:`);
@@ -269,6 +276,23 @@ HANDLER TYPES (built in)
       // future protected name forces explicit opt-in at the call site.
       const { isProtectedJobName } = await import('../core/minions/protected-names.ts');
       const trusted = isProtectedJobName(name) ? { allowProtectedSubmit: true } : undefined;
+
+      // v0.35.8.0: pre-enqueue shell-job validation. Validates `inherit:`
+      // closed enum, rejects secret env-keys, fail-fasts on missing config.
+      // Throws UnrecoverableError BEFORE `queue.add` so a bad payload never
+      // lands in `minion_jobs.data`. Defense-in-depth re-validation happens
+      // in the worker handler. See: src/core/minions/handlers/shell-validate.ts
+      if (name.trim() === 'shell') {
+        try {
+          const { validateShellJobParams } = await import('../core/minions/handlers/shell-validate.ts');
+          validateShellJobParams(data);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.error(`Error: ${msg}`);
+          process.exit(1);
+        }
+      }
+
       const job = await queue.add(name, data, {
         priority,
         delay: delay > 0 ? delay : undefined,
@@ -287,6 +311,9 @@ HANDLER TYPES (built in)
       try {
         const { logShellSubmission } = await import('../core/minions/handlers/shell-audit.ts');
         if (name.trim() === 'shell') {
+          const inheritNames = Array.isArray(data.inherit)
+            ? (data.inherit as unknown[]).filter((s): s is string => typeof s === 'string')
+            : undefined;
           logShellSubmission({
             caller: 'cli',
             remote: false,
@@ -296,6 +323,7 @@ HANDLER TYPES (built in)
             argv_display: Array.isArray(data.argv)
               ? (data.argv as unknown[]).filter((a): a is string => typeof a === 'string').map((a) => a.slice(0, 80))
               : undefined,
+            inherit: inheritNames && inheritNames.length > 0 ? inheritNames : undefined,
           });
         }
       } catch { /* audit failures never block submission */ }
@@ -786,7 +814,7 @@ HANDLER TYPES (built in)
       // ----- status subcommand -----
       if (isStatusCmd) {
         const { existsSync, readFileSync } = await import('fs');
-        const { readSupervisorEvents } = await import('../core/minions/handlers/supervisor-audit.ts');
+        const { readSupervisorEvents, summarizeCrashes } = await import('../core/minions/handlers/supervisor-audit.ts');
 
         let supervisorPid: number | null = null;
         let running = false;
@@ -803,10 +831,11 @@ HANDLER TYPES (built in)
 
         const events = readSupervisorEvents({ sinceMs: 24 * 60 * 60 * 1000 });
         const lastStart = events.filter(e => e.event === 'started').pop()?.ts ?? null;
-        const allExits = events.filter(e => e.event === 'worker_exited');
-        const realCrashes = allExits.filter(e => classifyWorkerExit(e as { code?: number | null }) === 'crash');
-        const cleanRestarts = allExits.length - realCrashes.length;
-        const crashes24h = realCrashes.length;
+        // Shared classifier — same code path runs in `gbrain doctor` so the
+        // two surfaces cannot drift on what counts as a crash. Supersedes
+        // v0.35.4.0's binary `classifyWorkerExit({code})` on this surface;
+        // see doctor.ts for the layering rationale.
+        const summary = summarizeCrashes(events);
         const maxCrashesEvent = events.filter(e => e.event === 'max_crashes_exceeded').pop() ?? null;
 
         const status = {
@@ -814,8 +843,9 @@ HANDLER TYPES (built in)
           supervisor_pid: supervisorPid,
           pid_file: pidFile,
           last_start: lastStart,
-          crashes_24h: crashes24h,
-          clean_restarts_24h: cleanRestarts,
+          crashes_24h: summary.total,
+          clean_exits_24h: summary.clean_exits,
+          crashes_by_cause: summary.by_cause,
           max_crashes_exceeded: !!maxCrashesEvent,
         };
 
@@ -826,7 +856,8 @@ HANDLER TYPES (built in)
           if (supervisorPid) console.log(`  PID:           ${supervisorPid}`);
           console.log(`  PID file:      ${pidFile}`);
           if (lastStart) console.log(`  Last start:    ${lastStart}`);
-          console.log(`  Crashes (24h): ${crashes24h}${cleanRestarts > 0 ? ` (${cleanRestarts} clean restarts excluded)` : ''}`);
+          console.log(`  Crashes (24h):     ${summary.total} (runtime=${summary.by_cause.runtime_error} oom=${summary.by_cause.oom_or_external_kill} unknown=${summary.by_cause.unknown} legacy=${summary.by_cause.legacy})`);
+          console.log(`  Clean exits (24h): ${summary.clean_exits}`);
           if (maxCrashesEvent) console.log(`  ⚠ Max crashes exceeded at ${maxCrashesEvent.ts}`);
         }
         process.exit(running ? 0 : 1);
@@ -1025,11 +1056,54 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
     const concurrencyOverride = typeof job.data.concurrency === 'number'
       ? job.data.concurrency
       : undefined;
+    // v0.36+ codex #5 fix: standalone `sync` handler now passes
+    // noExtract:true so doctor's remediation plan [sync, extract] doesn't
+    // double-extract (performSync inline-extract + standalone extract job).
+    // Pre-fix, runPhaseSync in cycle.ts passed noExtract:true but the
+    // standalone handler dropped it. Callers that want inline extract can
+    // pass { noExtract: false } in job params explicitly.
+    const noExtract = job.data.noExtract !== false;
     const result = await performSync(engine, {
-      repoPath, sourceId, noPull, noEmbed,
+      repoPath, sourceId, noPull, noEmbed, noExtract,
       concurrency: concurrencyOverride,
     });
-    return result;
+
+    // v0.40 D22: auto_embed_backfill defaults TRUE when sourceId is set AND
+    // the feature flag is enabled. Submits a child embed-backfill job
+    // (fire-and-forget — D15.1) so stale chunks get embedded async without
+    // the sync handler waiting on the embed pipeline.
+    const autoEmbed = job.data.auto_embed_backfill !== false;
+    let embedJobId: number | null = null;
+    let embedSkipReason: string | null = null;
+    if (autoEmbed && sourceId && result.status !== 'up_to_date' && result.status !== 'dry_run') {
+      try {
+        const { isFederatedV2Enabled } = await import('../core/feature-flags.ts');
+        if (await isFederatedV2Enabled(engine)) {
+          const { submitEmbedBackfill } = await import('../core/embed-backfill-submit.ts');
+          const submission = await submitEmbedBackfill(engine, sourceId, {
+            reason: typeof job.data.embed_reason === 'string'
+              ? (job.data.embed_reason as string)
+              : 'sync_handler',
+          });
+          if (submission.status === 'submitted') {
+            embedJobId = submission.jobId ?? null;
+          } else {
+            embedSkipReason = submission.status;
+          }
+        } else {
+          embedSkipReason = 'feature_flag_disabled';
+        }
+      } catch (err) {
+        // Embed-backfill submission failure must NOT fail the sync job.
+        embedSkipReason = `submit_error:${err instanceof Error ? err.message : String(err)}`;
+      }
+    } else if (!sourceId) {
+      embedSkipReason = 'no_source_id';
+    } else if (!autoEmbed) {
+      embedSkipReason = 'auto_embed_disabled';
+    }
+
+    return { ...result, embed_job_id: embedJobId, embed_skip_reason: embedSkipReason };
   });
 
   worker.register('embed', async (job) => {
@@ -1057,6 +1131,28 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
     const target = typeof job.data.dir === 'string' ? job.data.dir : '.';
     const result = await runLintCore({ target, fix: !!job.data.fix, dryRun: !!job.data.dryRun });
     return result;
+  });
+
+  // v0.40.3.0 T8b: RemediationStep consumer handlers. Thin wrappers
+  // around already-shipping CLI commands so doctor --remediate can
+  // submit them as Minion jobs. NOT in PROTECTED_JOB_NAMES (no shell
+  // exec, no cost spike, MCP-safe).
+  worker.register('lint-fix', async (job) => {
+    const { runLintCore } = await import('./lint.ts');
+    const target = typeof job.data.dir === 'string' ? job.data.dir : '.';
+    return await runLintCore({ target, fix: true, dryRun: false });
+  });
+
+  worker.register('integrity-auto', async () => {
+    const { runIntegrity } = await import('./integrity.ts');
+    await runIntegrity(['auto']);
+    return { ok: true };
+  });
+
+  worker.register('sync-retry-failed', async () => {
+    const { runSync } = await import('./sync.ts');
+    await runSync(engine, ['--retry-failed']);
+    return { ok: true };
   });
 
   worker.register('import', async (job) => {
@@ -1102,6 +1198,19 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
   // renewal callback and the stalled-sweeper kills the job.
   //
   // Phase failures surface as report.status='partial' (via runCycle's
+  // v0.40.3.0: per-page contextual retrieval re-embed handler. PROTECTED
+  // name (src/core/minions/protected-names.ts) — MCP/OAuth callers can't
+  // submit; only trusted local callers (config.ts mode-switch hook,
+  // reindex sweep, doctor --remediate). Composes the global Haiku rate-
+  // leaser per D26 P0-3 + delegates to contextual-retrieval-service.ts
+  // for the two-phase build.
+  {
+    const { makeContextualReindexHandler } = await import(
+      '../core/minions/handlers/contextual-reindex-per-chunk.ts'
+    );
+    worker.register('contextual_reindex_per_chunk', makeContextualReindexHandler({ engine }));
+  }
+
   // derivation); the handler returns { partial, status, report } so
   // `gbrain jobs get <id>` shows the full structured report. Does NOT
   // throw on partial: a flaky phase must not block every future cycle.
@@ -1111,6 +1220,53 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
       ? job.data.repoPath
       : (await engine.getConfig('sync.repo_path')) ?? '.';
 
+    // v0.38 (codex r1 P1-2 + P1-5): per-source dispatch threading.
+    //   - source_id: when set, runCycle uses the per-source lock ID and
+    //     writes last_full_cycle_at on success. Validated at handler entry
+    //     so queue replays with malformed source_id dead-letter instead of
+    //     reaching cycle code.
+    //   - pull: when set, overrides the legacy hardcoded `true` so
+    //     per-source dispatch can disable pull for local-only sources.
+    //     Missing/undefined keeps the legacy `true` for back-compat.
+    //   - Archive recheck: if source_id is set but the source was
+    //     archived between fan-out and worker claim, skip cleanly.
+    const rawSourceId = job.data.source_id;
+    let sourceId: string | undefined;
+    if (rawSourceId !== undefined && rawSourceId !== null) {
+      if (typeof rawSourceId !== 'string') {
+        throw new Error(`autopilot-cycle: invalid source_id (not a string): ${JSON.stringify(rawSourceId)}`);
+      }
+      const { isValidSourceId } = await import('../core/source-id.ts');
+      if (!isValidSourceId(rawSourceId)) {
+        // Dead-letter early — malformed source_id from queue replay shouldn't
+        // reach cycle code. TS narrowing via isValidSourceId boolean shape
+        // (assertValidSourceId would require static-import per TS2775).
+        throw new Error(`autopilot-cycle: invalid source_id (regex): ${JSON.stringify(rawSourceId)}`);
+      }
+      // Archive recheck (codex r1 P1-5): cheap pre-cycle lookup. Returns
+      // immediately if source is gone or archived; runCycle never even
+      // acquires a lock.
+      const rows = await engine.executeRaw<{ archived: boolean | null }>(
+        `SELECT archived FROM sources WHERE id = $1`,
+        [rawSourceId],
+      );
+      if (rows.length === 0) {
+        return {
+          partial: false,
+          status: 'skipped',
+          report: { reason: 'source_not_found', source_id: rawSourceId },
+        };
+      }
+      if (rows[0].archived === true) {
+        return {
+          partial: false,
+          status: 'skipped',
+          report: { reason: 'source_archived', source_id: rawSourceId },
+        };
+      }
+      sourceId = rawSourceId;
+    }
+
     // Allow callers to select phases via job data (e.g. skip embed for
     // fast cycles). Validates against ALL_PHASES to prevent injection.
     const { ALL_PHASES } = await import('../core/cycle.ts');
@@ -1119,10 +1275,14 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
       ? (job.data.phases as string[]).filter(p => validPhases.has(p as any))
       : undefined;
 
+    // Pull default: legacy `true` for back-compat; explicit boolean wins.
+    const pull = typeof job.data.pull === 'boolean' ? job.data.pull : true;
+
     const report = await runCycle(engine, {
       brainDir: repoPath,
-      pull: true, // autopilot daemon opts into git pull
+      pull,
       signal: job.signal, // propagate abort so cycle bails on timeout/cancel
+      ...(sourceId ? { sourceId } : {}),
       ...(requestedPhases && requestedPhases.length > 0 ? { phases: requestedPhases as any } : {}),
       yieldBetweenPhases: async () => {
         // Yield to the event loop so worker lock-renewal can fire.
@@ -1162,6 +1322,122 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
   worker.register('subagent', makeSubagentHandler({ engine }));
   worker.register('subagent_aggregator', subagentAggregatorHandler);
   process.stderr.write('[minion worker] subagent handlers enabled\n');
+
+  // ============================================================
+  // v0.38 ingestion substrate — ingest_capture handler. Receives
+  // IngestionEvent payloads from the daemon's dispatcher (file-watcher,
+  // inbox-folder, cron-scheduler sources) and from serve --http's
+  // POST /ingest route (webhook source). Routes through importFromContent
+  // to land as a brain page under inbox/YYYY-MM-DD-<hash6> (or the
+  // caller-provided slug).
+  // ============================================================
+  const { makeIngestCaptureHandler } = await import('../core/minions/handlers/ingest-capture.ts');
+  worker.register('ingest_capture', makeIngestCaptureHandler(engine));
+
+  // ============================================================
+  // v0.36+ brain-health-100 wave: 11 new handlers for autonomous
+  // remediation via `gbrain doctor --remediate` and autopilot.
+  //
+  // PROTECTED via PROTECTED_JOB_NAMES (D11): synthesize, patterns,
+  // consolidate — they internally submit `subagent` jobs with
+  // allowProtectedSubmit=true, so they CAN spend Anthropic credits.
+  // Open handlers (DB writes only): reindex, repair-jsonb, orphans,
+  // integrity, purge, extract_facts, resolve_symbol_edges,
+  // recompute_emotional_weight.
+  // ============================================================
+
+  worker.register('reindex', async (job) => {
+    const { runReindex } = await import('./reindex.ts');
+    const args: string[] = ['--markdown'];
+    if (typeof job.data.limit === 'number') args.push('--limit', String(job.data.limit));
+    if (job.data.dryRun) args.push('--dry-run');
+    if (job.data.noEmbed) args.push('--no-embed');
+    if (typeof job.data.repoPath === 'string') args.push('--repo', job.data.repoPath);
+    const result = await runReindex(engine, args);
+    return { ...result, ran: 'reindex' };
+  });
+
+  worker.register('repair-jsonb', async (job) => {
+    const { repairJsonb } = await import('./repair-jsonb.ts');
+    const dryRun = !!job.data.dryRun;
+    const result = await repairJsonb({ dryRun });
+    return result;
+  });
+
+  worker.register('orphans', async (_job) => {
+    const result = await engine.findOrphanPages();
+    return { count: result.length, orphans: result };
+  });
+
+  worker.register('integrity', async (job) => {
+    const { runIntegrity } = await import('./integrity.ts');
+    const args: string[] = [];
+    args.push(job.data.mode === 'auto' ? 'auto' : 'check');
+    if (typeof job.data.confidence === 'number') args.push('--confidence', String(job.data.confidence));
+    if (job.data.dryRun) args.push('--dry-run');
+    await runIntegrity(args);
+    return { ran: 'integrity', mode: args[0] };
+  });
+
+  worker.register('purge', async (job) => {
+    const scope = (typeof job.data.scope === 'string' && ['pages', 'sources', 'all'].includes(job.data.scope))
+      ? (job.data.scope as 'pages' | 'sources' | 'all')
+      : 'all';
+    const olderThanHours = typeof job.data.olderThanHours === 'number' ? job.data.olderThanHours : 72;
+    const dryRun = !!job.data.dryRun;
+    let pagesPurged = 0;
+    let sourcesPurged: string[] = [];
+    if (scope === 'pages' || scope === 'all') {
+      const result = await engine.purgeDeletedPages(olderThanHours);
+      pagesPurged = result.count;
+    }
+    if (scope === 'sources' || scope === 'all') {
+      const { purgeExpiredSources } = await import('../core/destructive-guard.ts');
+      sourcesPurged = await purgeExpiredSources(engine);
+    }
+    // GC stale op_checkpoints rows (folded scope item +C from review).
+    const { purgeStaleCheckpoints } = await import('../core/op-checkpoint.ts');
+    const checkpointsPurged = await purgeStaleCheckpoints(engine, 7);
+    return { pagesPurged, sourcesPurged, checkpointsPurged, dryRun };
+  });
+
+  // Phase-wrapper handlers — each delegates to runCycle({ phases: [name] }).
+  // Cycle owns the lock + abort signal + progress reporter per D10.
+  // Smaller diff than full standalone phase extraction; cycle.ts remains
+  // the single source of truth for phase semantics.
+  const makePhaseHandler = (phase: string) => async (job: any) => {
+    const { runCycle } = await import('../core/cycle.ts');
+    const repoPath = typeof job.data.repoPath === 'string'
+      ? job.data.repoPath
+      : ((await engine.getConfig('sync.repo_path')) ?? '.');
+    const report = await runCycle(engine, {
+      brainDir: repoPath,
+      phases: [phase as any],
+      signal: job.signal,
+    });
+    return { phase, status: report.status, report };
+  };
+
+  // PROTECTED — internally spawn subagent children
+  worker.register('synthesize', makePhaseHandler('synthesize'));
+  worker.register('patterns', makePhaseHandler('patterns'));
+  worker.register('consolidate', makePhaseHandler('consolidate'));
+
+  // Open — DB writes only, no LLM spend
+  worker.register('extract_facts', makePhaseHandler('extract_facts'));
+  worker.register('resolve_symbol_edges', makePhaseHandler('resolve_symbol_edges'));
+  worker.register('recompute_emotional_weight', makePhaseHandler('recompute_emotional_weight'));
+
+  // v0.40 Federated Sync v2 — embed-backfill: per-source decoupled embed.
+  // Cost-bounded via D6 ($10/job BudgetTracker) + D19 (source-level cooldown
+  // + 24h rolling cap, gated at submit time). NOT in PROTECTED_JOB_NAMES —
+  // embedding-only spend, no API-by-the-minute risk like subagent.
+  worker.register('embed-backfill', async (job) => {
+    const { makeEmbedBackfillHandler } = await import('../core/minions/handlers/embed-backfill.ts');
+    return await makeEmbedBackfillHandler(engine)(job);
+  });
+
+  process.stderr.write('[minion worker] brain-health-100 handlers registered (11 ops, 3 protected) + embed-backfill (v0.40)\n');
 
   // Plugin discovery — one line per discovered plugin (mirrors the
   // openclaw-seam startup line convention from v0.11+). Loaded

@@ -4,6 +4,9 @@ import type { ChunkInput } from '../core/types.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 import { createProgress, type ProgressReporter } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
+import { assertEmbeddingEnabled } from '../core/embedding-dim-check.ts';
+import { loadConfig } from '../core/config.ts';
+import { slog, serr } from '../core/console-prefix.ts';
 
 export interface EmbedOpts {
   /** Embed ALL pages (every chunk). */
@@ -66,7 +69,75 @@ export interface EmbedResult {
  * Returns EmbedResult with accurate counts so callers (runCycle, sync
  * auto-embed step) can report embeddings in their own structured output.
  */
+/**
+ * Tagged error class thrown when the schema column dim disagrees with
+ * the gateway's resolved dim. Caught by `runEmbed` (the CLI wrapper) to
+ * emit a paste-ready recipe instead of raw Postgres errors page by page.
+ *
+ * v0.37 fix wave (Lane D.2 + CDX2-9). Pre-fix the worker pool ran the
+ * whole queue past the first dim mismatch because per-page errors were
+ * silently logged + skipped. Now `runEmbedCore` pre-flights at entry +
+ * the worker pool catches per-page mismatches and surfaces them.
+ */
+export class EmbeddingDimMismatchError extends Error {
+  readonly kind = 'embedding_dim_mismatch' as const;
+  constructor(public readonly recipeMessage: string) {
+    super(recipeMessage);
+    this.name = 'EmbeddingDimMismatchError';
+  }
+}
+
+/**
+ * Pre-flight check: read the actual schema column dim and compare to the
+ * gateway's resolved dim. Throws `EmbeddingDimMismatchError` on mismatch
+ * so the entry-point catch surfaces the recipe. Catches the headline
+ * fresh-install bug class at the very first invocation instead of letting
+ * the worker pool hammer N pages with raw 22000 errors.
+ */
+async function preflightDimMismatch(engine: BrainEngine, dryRun: boolean): Promise<void> {
+  if (dryRun) return; // dry-run never embeds, no risk
+  const { readContentChunksEmbeddingDim, embeddingMismatchMessage } = await import('../core/embedding-dim-check.ts');
+  const { getEmbeddingDimensions, getEmbeddingModel } = await import('../core/ai/gateway.ts');
+  let existing;
+  try {
+    existing = await readContentChunksEmbeddingDim(engine);
+  } catch {
+    return; // probe failure shouldn't block embed; the worker pool will surface real errors
+  }
+  if (!existing.exists || existing.dims === null) return;
+  let resolvedDims: number;
+  let resolvedModel: string;
+  try {
+    resolvedDims = getEmbeddingDimensions();
+    resolvedModel = getEmbeddingModel();
+  } catch {
+    return; // gateway unconfigured — worker pool will error informatively
+  }
+  if (existing.dims === resolvedDims) return;
+  const databasePath = (engine as { _savedConfig?: { database_path?: string } })._savedConfig?.database_path;
+  const recipe = embeddingMismatchMessage({
+    currentDims: existing.dims,
+    requestedDims: resolvedDims,
+    requestedModel: resolvedModel,
+    source: 'embed',
+    engineKind: engine.kind,
+    databasePath,
+  });
+  throw new EmbeddingDimMismatchError(recipe);
+}
+
 export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promise<EmbedResult> {
+  // v0.37.10.0 T7 (D9): refuse cleanly when init persisted the deferred-setup
+  // sentinel. Skipped in dryRun mode so plan-mode introspection still works.
+  if (!opts.dryRun) {
+    assertEmbeddingEnabled(loadConfig());
+  }
+
+  // v0.37.11.0 (Lane D.2): pre-flight dim-mismatch check. Catches the headline
+  // fresh-install bug class before the worker pool spends 20 parallel calls
+  // hitting raw Postgres dimension errors.
+  await preflightDimMismatch(engine, !!opts.dryRun);
+
   const result: EmbedResult = {
     embedded: 0,
     skipped: 0,
@@ -81,7 +152,7 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
       try {
         await embedPage(engine, s, !!opts.dryRun, result, opts.sourceId);
       } catch (e: unknown) {
-        console.error(`  Error embedding ${s}: ${e instanceof Error ? e.message : e}`);
+        serr(`  Error embedding ${s}: ${e instanceof Error ? e.message : e}`);
       }
     }
     return result;
@@ -98,6 +169,31 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
 }
 
 export async function runEmbed(engine: BrainEngine, args: string[]): Promise<EmbedResult | undefined> {
+  // v0.36+ T7: --background submits via Minion queue, returns job_id to
+  // stdout, exits. Same semantics in TTY and cron (D9).
+  if (args.includes('--background')) {
+    const { maybeBackground } = await import('../core/cli-options.ts');
+    const backgrounded = await maybeBackground({
+      engine,
+      args,
+      jobName: 'embed',
+      paramBuilder: (cleanArgs) => {
+        const slugsI = cleanArgs.indexOf('--slugs');
+        const srcI = cleanArgs.indexOf('--source');
+        return {
+          all: cleanArgs.includes('--all'),
+          stale: cleanArgs.includes('--stale'),
+          dryRun: cleanArgs.includes('--dry-run'),
+          slugs: slugsI >= 0 ? cleanArgs.slice(slugsI + 1).filter(a => !a.startsWith('--')) : undefined,
+          sourceId: srcI >= 0 ? cleanArgs[srcI + 1] : undefined,
+        };
+      },
+      source: 'cli',
+    });
+    if (backgrounded) return;
+    // PGLite degraded to inline — fall through.
+  }
+
   const slugsIdx = args.indexOf('--slugs');
   const all = args.includes('--all');
   const stale = args.includes('--stale');
@@ -114,7 +210,7 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
   } else {
     const slug = args.find(a => !a.startsWith('--'));
     if (!slug) {
-      console.error('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...] [--dry-run]');
+      serr('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...] [--dry-run]');
       process.exit(1);
     }
     opts = { slug, dryRun, sourceId };
@@ -139,7 +235,13 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
     return result;
   } catch (e) {
     if (progressStarted) progress.finish();
-    console.error(e instanceof Error ? e.message : String(e));
+    // D.2: surface dim-mismatch failures with the paste-ready recipe
+    // instead of the raw Postgres error message.
+    if (e instanceof EmbeddingDimMismatchError) {
+      serr('\n' + e.recipeMessage + '\n');
+    } else {
+      serr(e instanceof Error ? e.message : String(e));
+    }
     process.exit(1);
   }
 }
@@ -194,7 +296,7 @@ async function embedPage(
   result.skipped += chunks.length - toEmbed.length;
 
   if (toEmbed.length === 0) {
-    console.log(`${slug}: all ${chunks.length} chunks already embedded`);
+    slog(`${slug}: all ${chunks.length} chunks already embedded`);
     result.pages_processed++;
     return;
   }
@@ -221,7 +323,7 @@ async function embedPage(
   await engine.upsertChunks(slug, updated, opts);
   result.embedded += toEmbed.length;
   result.pages_processed++;
-  console.log(`${slug}: embedded ${toEmbed.length} chunks`);
+  slog(`${slug}: embedded ${toEmbed.length} chunks`);
 }
 
 async function embedAll(
@@ -308,7 +410,7 @@ async function embedAll(
       await engine.upsertChunks(page.slug, updated, pageOpts);
       result.embedded += toEmbed.length;
     } catch (e: unknown) {
-      console.error(`\n  Error embedding ${page.slug}: ${e instanceof Error ? e.message : e}`);
+      serr(`\n  Error embedding ${page.slug}: ${e instanceof Error ? e.message : e}`);
     }
 
     processed++;
@@ -334,9 +436,9 @@ async function embedAll(
 
   // Stdout summary preserved for scripts/tests that grep for counts.
   if (dryRun) {
-    console.log(`[dry-run] Would embed ${result.would_embed} chunks across ${pages.length} pages`);
+    slog(`[dry-run] Would embed ${result.would_embed} chunks across ${pages.length} pages`);
   } else {
-    console.log(`Embedded ${result.embedded} chunks across ${pages.length} pages`);
+    slog(`Embedded ${result.embedded} chunks across ${pages.length} pages`);
   }
 }
 
@@ -373,9 +475,9 @@ async function embedAllStale(
   const staleCount = await engine.countStaleChunks(sourceOpt);
   if (staleCount === 0) {
     if (dryRun) {
-      console.log('[dry-run] Would embed 0 chunks (0 stale found)');
+      slog('[dry-run] Would embed 0 chunks (0 stale found)');
     } else {
-      console.log('Embedded 0 chunks (0 stale found)');
+      slog('Embedded 0 chunks (0 stale found)');
     }
     return;
   }
@@ -384,7 +486,7 @@ async function embedAllStale(
     result.would_embed += staleCount;
     result.total_chunks += staleCount;
     if (onProgress) onProgress(1, 1, 0);
-    console.log(`[dry-run] Would embed ${staleCount} stale chunks`);
+    slog(`[dry-run] Would embed ${staleCount} stale chunks`);
     return;
   }
 
@@ -417,7 +519,7 @@ async function embedAllStale(
     while (true) {
       if (budgetSignal.aborted) {
         if (!budgetExitNotified) {
-          console.error(`\n  [embed] wall-clock budget (${BUDGET_MS}ms) exceeded; exiting cleanly. Re-run picks up via partial index.`);
+          serr(`\n  [embed] wall-clock budget (${BUDGET_MS}ms) exceeded; exiting cleanly. Re-run picks up via partial index.`);
           budgetExitNotified = true;
         }
         break;
@@ -475,7 +577,7 @@ async function embedAllStale(
           // Budget-fired aborts are expected on the way out; don't spam
           // per-page "Error embedding" lines when we're shutting down.
           if (budgetSignal.aborted) return;
-          console.error(`\n  Error embedding ${slug}: ${e instanceof Error ? e.message : e}`);
+          serr(`\n  Error embedding ${slug}: ${e instanceof Error ? e.message : e}`);
         }
         totalProcessedPages++;
         result.pages_processed++;
@@ -504,7 +606,7 @@ async function embedAllStale(
     clearTimeout(budgetTimer);
   }
 
-  console.log(`Embedded ${result.embedded} chunks across ${totalProcessedPages} pages`);
+  slog(`Embedded ${result.embedded} chunks across ${totalProcessedPages} pages`);
 }
 
 /**
@@ -630,7 +732,7 @@ export async function embedBatchWithBackoff(
       if (!isRateLimit || attempt === MAX_RATE_LIMIT_RETRIES) throw e;
 
       const delayMs = parseRetryDelayMs(msg);
-      console.error(`  [rate-limit] attempt ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES}, waiting ${delayMs}ms...`);
+      serr(`  [rate-limit] attempt ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES}, waiting ${delayMs}ms...`);
       await abortableSleep(delayMs, signal);
     }
   }

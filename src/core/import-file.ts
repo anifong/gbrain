@@ -14,6 +14,16 @@ import type { ChunkInput, PageInput, PageType } from './types.ts';
 import { computeEffectiveDate } from './effective-date.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import { logSlugFallback } from './audit-slug-fallback.ts';
+import { resolveContextualRetrievalMode } from './contextual-retrieval-resolver.ts';
+import {
+  buildContextualPrefix,
+  modeRequiresHaiku,
+  modeRequiresWrapper,
+  sanitizeTitle,
+  wrapChunkForEmbedding,
+} from './embedding-context.ts';
+import { loadSearchModeConfig, resolveSearchMode } from './search/mode.ts';
+import { computeCorpusGeneration } from './contextual-retrieval-service.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -214,6 +224,27 @@ export async function importFromContent(
      * the version bump.
      */
     forceRechunk?: boolean;
+    /**
+     * v0.39.0.0 T1.5: active schema pack for type inference. When set, parseMarkdown
+     * uses the pack's path_prefixes instead of the hardcoded gbrain-base table.
+     * When unset, falls back to pre-v0.39 behavior (parity gate stays green).
+     * Callers thread this from `loadActivePack(ctx)` once per command —
+     * NEVER per file inside sync (codex perf finding #7).
+     */
+    activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> };
+    /**
+     * v0.39.3.0 provenance write-through (WARN-8). When set, threaded to
+     * `tx.putPage` so the page's `source_kind`, `source_uri`,
+     * `ingested_via` DB columns get populated. The trust gate lives at the
+     * `put_page` op layer — by the time importFromContent sees these, the
+     * caller is already trusted (capture CLI sets them; remote MCP callers
+     * had theirs overridden to `mcp:put_page` upstream). `ingested_at` is
+     * NOT a caller-controllable param; the engine's putPage stamps it
+     * server-side via now() when any provenance write fires.
+     */
+    source_kind?: string | null;
+    source_uri?: string | null;
+    ingested_via?: string | null;
   } = {},
 ): Promise<ImportResult> {
   // v0.18.0+ multi-source: when caller is syncing under a non-default source,
@@ -235,16 +266,36 @@ export async function importFromContent(
     };
   }
 
-  const parsed = parseMarkdown(content, slug + '.md');
+  const parsed = parseMarkdown(content, slug + '.md', { activePack: opts.activePack });
 
-  // Hash includes ALL fields for idempotency (not just compiled_truth + timeline)
+  // v0.39.3.0 CV8 — DB content_hash excludes timestamp-bearing frontmatter
+  // keys so identical body content from `gbrain capture` (which stamps
+  // `captured_at` and `ingested_at` per call) produces a stable hash.
+  // Pre-fix, every capture-cli invocation produced a fresh hash because
+  // the timestamp changed, defeating:
+  //   - the existing.content_hash === hash short-circuit below (every
+  //     capture re-chunked + re-embedded unchanged content — wasted
+  //     embedding spend)
+  //   - the daemon's 24h LRU dedup (separate consumer keyed on same hash)
+  //
+  // We strip ONLY the timestamp keys, not the whole frontmatter object.
+  // Stripping all frontmatter would regress sync: a user adding a tag
+  // would update the frontmatter without changing the body, the hash
+  // would not change, and tag reconciliation would silently no-op
+  // (this function returns early on hash-match).
+  const HASH_EPHEMERAL_FRONTMATTER_KEYS = ['captured_at', 'ingested_at'];
+  const stableFrontmatter: Record<string, unknown> = { ...parsed.frontmatter };
+  for (const k of HASH_EPHEMERAL_FRONTMATTER_KEYS) {
+    delete stableFrontmatter[k];
+  }
+  // Hash includes all meaningful fields for idempotency.
   const hash = createHash('sha256')
     .update(JSON.stringify({
       title: parsed.title,
       type: parsed.type,
       compiled_truth: parsed.compiled_truth,
       timeline: parsed.timeline,
-      frontmatter: parsed.frontmatter,
+      frontmatter: stableFrontmatter,
       tags: parsed.tags.sort(),
     }))
     .digest('hex');
@@ -286,13 +337,68 @@ export async function importFromContent(
   // Embed BEFORE the transaction (external API call).
   // v0.14+ (Codex C2): embedding failure PROPAGATES. Silent drop accumulates
   // unembedded pages invisibly. Caller can pass opts.noEmbed=true to skip.
+  //
+  // v0.40.3.0 contextual retrieval wrapper (D20-T1 chunk_text separation):
+  // - Resolve effective CR mode via the page/source/global override chain.
+  // - For title tier (free): build the title-only prefix and wrap chunks
+  //   inline at embed time. Per-chunk Haiku synopsis tier is NOT supported
+  //   on the import path — that's an async backfill via the Minion handler
+  //   (the cost prompt + 10s grace UX from D3 gates spending; inline import
+  //   path takes the cheaper title-only treatment for tokenmax pages here
+  //   and defers per-chunk synopsis to the Minion-driven sweep).
+  // - Stored chunk_text stays canonical; only the embedding input is wrapped.
+  // - Code chunks (chunk_source='fenced_code') bypass wrapping per D20-T4.
+  let effectiveCRMode: 'none' | 'title' | 'per_chunk_synopsis' = 'none';
+  if (!opts.noEmbed) {
+    const searchInput = await loadSearchModeConfig(engine);
+    const knobs = resolveSearchMode(searchInput);
+    // Look up the source row for this import; default to host trust when
+    // the engine's getConfig path doesn't surface a source row (most calls).
+    const resolution = resolveContextualRetrievalMode({
+      pageFrontmatter: parsed.frontmatter,
+      source: {
+        id: sourceId ?? 'default',
+        contextual_retrieval_mode: null,
+        trust_frontmatter_overrides: false,
+      },
+      globalMode: knobs.contextual_retrieval,
+      killSwitchDisabled: knobs.contextual_retrieval_disabled,
+    });
+    // Inline path: title-tier wrap is free. per_chunk_synopsis is too
+    // expensive for the inline import path; the page lands at the
+    // title tier on disk and the Minion-driven contextual reindex
+    // upgrades it later when the user accepts the cost prompt.
+    effectiveCRMode = resolution.mode === 'per_chunk_synopsis' ? 'title' : resolution.mode;
+  }
+
   if (!opts.noEmbed && chunks.length > 0) {
-    const embeddings = await embedBatch(chunks.map(c => c.chunk_text));
+    const safeTitle = sanitizeTitle(parsed.title);
+    const prefix =
+      modeRequiresWrapper(effectiveCRMode) && !modeRequiresHaiku(effectiveCRMode)
+        ? buildContextualPrefix(safeTitle, null)
+        : null;
+    const wrappedTexts = prefix
+      ? chunks.map((c) => wrapChunkForEmbedding(c.chunk_text, prefix, c.chunk_source))
+      : chunks.map((c) => c.chunk_text);
+    const embeddings = await embedBatch(wrappedTexts);
     for (let i = 0; i < chunks.length; i++) {
       chunks[i].embedding = embeddings[i];
-      chunks[i].token_count = Math.ceil(chunks[i].chunk_text.length / 4);
+      // token_count tracks the wrapped string length so cost reporting
+      // reflects what we actually sent to the embedder.
+      chunks[i].token_count = Math.ceil(wrappedTexts[i].length / 4);
     }
   }
+
+  // v0.40.3.0: corpus_generation hash for D27 P1-5 cache invalidation.
+  // Only set when we actually applied a wrapper; 'none' tier writes NULL
+  // so the column reflects "no CR shape applied" rather than a stale hash.
+  const corpusGeneration =
+    effectiveCRMode === 'none' || opts.noEmbed
+      ? null
+      : computeCorpusGeneration({
+          crMode: effectiveCRMode,
+          haikuModel: 'anthropic:claude-haiku-4-5-20251001',
+        });
 
   // Transaction wraps all DB writes. Every per-page tx call carries the
   // caller's sourceId so writes target (sourceId, slug) rather than the
@@ -335,7 +441,29 @@ export async function importFromContent(
       // code can resolve frontmatter-fallback slugs back to their files.
       chunker_version: MARKDOWN_CHUNKER_VERSION,
       source_path: opts.sourcePath ?? null,
+      // v0.39.3.0 provenance write-through (WARN-8). Engine layer applies
+      // COALESCE-preserve UPDATE so omitting these on a later put_page
+      // doesn't erase the original ingestion's audit trail.
+      source_kind: opts.source_kind ?? null,
+      source_uri: opts.source_uri ?? null,
+      ingested_via: opts.ingested_via ?? null,
+      // ingested_at is server-stamped at the engine layer when any
+      // provenance write fires; never client-controlled.
     }, txOpts);
+
+    // v0.40.3.0: stamp the contextual retrieval state columns alongside
+    // the page write. updatePageContextualRetrievalState is a narrow
+    // UPDATE that runs after putPage's INSERT/UPDATE so the row exists.
+    // For opts.noEmbed callers, we skip stamping — the next embed pass
+    // (gbrain embed --stale or contextual reindex Minion) will set it.
+    if (!opts.noEmbed) {
+      await tx.updatePageContextualRetrievalState(
+        slug,
+        sourceId ?? 'default',
+        effectiveCRMode,
+        corpusGeneration,
+      );
+    }
 
     // Tag reconciliation: remove stale, add current
     const existingTags = await tx.getTags(slug, txOpts);
@@ -409,7 +537,18 @@ export async function importFromFile(
   engine: BrainEngine,
   filePath: string,
   relativePath: string,
-  opts: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean } = {},
+  opts: {
+    noEmbed?: boolean;
+    inferFrontmatter?: boolean;
+    sourceId?: string;
+    forceRechunk?: boolean;
+    /**
+     * v0.39 T1.5: active schema pack threaded through to importFromContent so
+     * `parseMarkdown` uses pack-driven type inference. Load ONCE per command;
+     * never per file (codex perf finding #7).
+     */
+    activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> };
+  } = {},
 ): Promise<ImportResult> {
   // Defense-in-depth: reject symlinks before reading content.
   const lstat = lstatSync(filePath);
@@ -446,7 +585,7 @@ export async function importFromFile(
     }
   }
 
-  const parsed = parseMarkdown(content, relativePath);
+  const parsed = parseMarkdown(content, relativePath, { activePack: opts.activePack });
 
   // Enforce path-authoritative slug. parseMarkdown prefers frontmatter.slug over
   // the path-derived slug, so a mismatch here means the frontmatter is trying
@@ -634,7 +773,7 @@ export async function importCodeFile(
     if (existing) await tx.createVersion(slug, txOpts);
 
     await tx.putPage(slug, {
-      type: 'code' as PageType,
+      type: 'code' as string,
       page_kind: 'code',
       title,
       compiled_truth: content,

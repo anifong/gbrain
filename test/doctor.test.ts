@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 
 describe('doctor command', () => {
   test('doctor module exports runDoctor', async () => {
@@ -479,10 +479,13 @@ describe('v0.32.4 — sync_freshness check', () => {
   test('exact 72h boundary → warn (>72h strict; 72h source NOT yet fail)', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     // Exactly 72h. Strict `>` on fail threshold means 72h-stale is still in
-    // the warn window. (Tested boundary semantics.)
+    // the warn window. The `nowMs` injection pins both clock reads to the
+    // same instant — without it, drift between `agoMs` and `Date.now()` in
+    // the check pushes ageMs above the threshold and flips the boundary.
+    const nowMs = Date.now();
     const result = await checkSyncFreshness(makeStubEngine([
-      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: agoMs(72 * 60 * 60 * 1000) },
-    ]));
+      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: new Date(nowMs - 72 * 60 * 60 * 1000) },
+    ]), { nowMs });
     expect(result.status).toBe('warn');
     expect(result.message).toContain('72h ago');
   });
@@ -499,9 +502,12 @@ describe('v0.32.4 — sync_freshness check', () => {
   test('exact 24h boundary → ok (>24h strict)', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     // Exactly 24h. Strict `>` on warn threshold means 24h-stale is still ok.
+    // Same `nowMs` pinning as the 72h boundary test above — both clock reads
+    // must hit the same instant or μs-scale drift flips the boundary.
+    const nowMs = Date.now();
     const result = await checkSyncFreshness(makeStubEngine([
-      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: agoMs(24 * 60 * 60 * 1000) },
-    ]));
+      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: new Date(nowMs - 24 * 60 * 60 * 1000) },
+    ]), { nowMs });
     expect(result.status).toBe('ok');
     expect(result.message).toContain('synced recently');
   });
@@ -579,6 +585,65 @@ describe('v0.32.4 — sync_freshness check', () => {
   });
 });
 
+// Supervisor crash classifier wiring. Pre-fix, doctor.ts:1013 counted every
+// `worker_exited` event as a crash regardless of `likely_cause`, inflating
+// `crashes_24h` to 120+/day from RSS-watchdog drains and SIGTERM stops.
+// These tests pin the read-side wiring so doctor and `gbrain jobs supervisor
+// status` (jobs.ts:805) cannot drift: both go through `summarizeCrashes`.
+describe('supervisor crash classifier wiring (v0.35.x)', () => {
+  test('doctor.ts uses summarizeCrashes — no ad-hoc worker_exited filter', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    // Wired to the shared helper.
+    expect(source).toContain('summarizeCrashes');
+    // The pre-fix ad-hoc filter pattern must NOT survive. The exact buggy
+    // expression was `events.filter(e => e.event === 'worker_exited').length`.
+    // Match the structural fingerprint, not whitespace.
+    expect(source).not.toMatch(
+      /events\.filter\([^)]*e\.event\s*===\s*'worker_exited'[^)]*\)\.length/,
+    );
+  });
+
+  test('doctor.ts warn threshold dropped from >3 to >=1', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    // The pre-fix `crashes24h > 3` threshold made sense only because the
+    // counter was over-counting clean exits. Under accurate counts, any real
+    // crash is signal — threshold lands at `>=1`.
+    expect(source).toMatch(/crashes24h\s*>=\s*1/);
+    // The old `> 3` predicate must not survive on the supervisor check.
+    expect(source).not.toMatch(/crashes24h\s*>\s*3/);
+  });
+
+  test('doctor.ts ok + warn messages include per-cause breakdown and clean_exits_24h', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    // Per-cause breakdown surfaces qualitative signal (oom vs runtime vs unknown
+    // vs legacy) so operators can triage without grep'ing JSONL.
+    expect(source).toContain('runtime=');
+    expect(source).toContain('oom=');
+    expect(source).toContain('unknown=');
+    expect(source).toContain('legacy=');
+    // Clean-exit count surfaces alongside crash count for transparency.
+    expect(source).toContain('clean_exits_24h=');
+  });
+
+  test('jobs.ts supervisor status uses summarizeCrashes — same wiring as doctor', async () => {
+    const source = await Bun.file(new URL('../src/commands/jobs.ts', import.meta.url)).text();
+    // Both surfaces MUST go through the shared helper. Without this, the two
+    // CLI commands report drifting crash counts (the bug class codex caught
+    // during the eng review outside-voice pass).
+    expect(source).toContain('summarizeCrashes');
+    expect(source).not.toMatch(
+      /events\.filter\([^)]*e\.event\s*===\s*'worker_exited'[^)]*\)\.length/,
+    );
+    // JSON output exposes the per-cause breakdown so dashboards/monitors can
+    // distinguish memory pressure from code bugs without re-classifying.
+    expect(source).toContain('crashes_by_cause');
+    expect(source).toContain('clean_exits_24h');
+  });
+});
+
+// v0.34.5 stub-guard observability tests (from v0.35.4.0). Doctor surfaces
+// the 24h fire count for the resolver-stub-guard. WARN at >10 hits is the
+// signal that prefix-expansion in resolveEntitySlug is missing a case.
 describe('stub_guard_24h check (v0.34.5)', () => {
   test('doctor source defines the stub_guard_24h check', async () => {
     const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
@@ -614,5 +679,110 @@ describe('stub_guard_24h check (v0.34.5)', () => {
     // Codify this in source-grep form so a future refactor doesn't add an
     // "ok: 0 hits" line that pollutes every doctor run.
     expect(source).toMatch(/events\.length === 0|Zero hits is the goal/);
+  });
+});
+
+describe('v0.40.4 — graph_signals_coverage check', () => {
+  const { PGLiteEngine } = require('../src/core/pglite-engine.ts');
+  const { checkGraphSignalsCoverage } = require('../src/commands/doctor.ts');
+
+  let engine: any;
+
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({ engine: 'pglite' });
+    await engine.initSchema();
+  });
+
+  afterAll(async () => {
+    if (engine) await engine.disconnect();
+  });
+
+  beforeEach(async () => {
+    // Wipe pages + links + config between tests for isolation.
+    await engine.executeRaw(`DELETE FROM links`);
+    await engine.executeRaw(`DELETE FROM pages`);
+    await engine.executeRaw(`DELETE FROM config WHERE key IN ('search.graph_signals', 'search.mode')`);
+  });
+
+  test('graph_signals disabled (conservative mode) → silent ok regardless of coverage', async () => {
+    await engine.setConfig('search.mode', 'conservative');
+    // Seed pages without links (would normally warn) but conservative
+    // disables graph_signals so the check stays ok.
+    for (let i = 0; i < 5; i++) {
+      await engine.putPage(`page/${i}`, { type: 'note', title: `page-${i}`, compiled_truth: 'body' });
+    }
+    const check = await checkGraphSignalsCoverage(engine);
+    expect(check.status).toBe('ok');
+    expect(check.message).toContain('disabled');
+  });
+
+  test('graph_signals enabled (balanced default) + zero links → warn at <10%', async () => {
+    // No config set → balanced default (graph_signals=true).
+    for (let i = 0; i < 10; i++) {
+      await engine.putPage(`page/${i}`, { type: 'note', title: `page-${i}`, compiled_truth: 'body' });
+    }
+    const check = await checkGraphSignalsCoverage(engine);
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('0.0%');
+    expect(check.message).toContain('gbrain extract all');
+  });
+
+  test('graph_signals enabled + >=30% coverage → ok with metric', async () => {
+    for (let i = 0; i < 10; i++) {
+      await engine.putPage(`page/${i}`, { type: 'note', title: `page-${i}`, compiled_truth: 'body' });
+    }
+    // Add inbound links to 4/10 pages = 40%.
+    await engine.addLinksBatch([
+      { from_slug: 'page/0', to_slug: 'page/1', link_type: 'mentions' },
+      { from_slug: 'page/0', to_slug: 'page/2', link_type: 'mentions' },
+      { from_slug: 'page/0', to_slug: 'page/3', link_type: 'mentions' },
+      { from_slug: 'page/0', to_slug: 'page/4', link_type: 'mentions' },
+    ]);
+    const check = await checkGraphSignalsCoverage(engine);
+    expect(check.status).toBe('ok');
+    expect(check.message).toContain('40.0%');
+    expect(check.message).toContain('fire on most queries');
+  });
+
+  test('graph_signals enabled + 10-29% coverage → ok with occasional-fire note', async () => {
+    for (let i = 0; i < 10; i++) {
+      await engine.putPage(`page/${i}`, { type: 'note', title: `page-${i}`, compiled_truth: 'body' });
+    }
+    // Add inbound to 2/10 = 20%.
+    await engine.addLinksBatch([
+      { from_slug: 'page/0', to_slug: 'page/1', link_type: 'mentions' },
+      { from_slug: 'page/0', to_slug: 'page/2', link_type: 'mentions' },
+    ]);
+    const check = await checkGraphSignalsCoverage(engine);
+    expect(check.status).toBe('ok');
+    expect(check.message).toContain('20.0%');
+    expect(check.message).toContain('fire occasionally');
+  });
+
+  test('explicit search.graph_signals=false overrides mode default', async () => {
+    // Balanced normally enables; explicit override turns it off.
+    await engine.setConfig('search.graph_signals', 'false');
+    // No links → would normally warn, but override means we don't check.
+    for (let i = 0; i < 5; i++) {
+      await engine.putPage(`page/${i}`, { type: 'note', title: `page-${i}`, compiled_truth: 'body' });
+    }
+    const check = await checkGraphSignalsCoverage(engine);
+    expect(check.status).toBe('ok');
+    expect(check.message).toContain('disabled');
+  });
+
+  test('empty brain → ok with explanation', async () => {
+    const check = await checkGraphSignalsCoverage(engine);
+    expect(check.status).toBe('ok');
+    expect(check.message).toContain('Empty brain');
+  });
+
+  test('check is wired into runDoctor (source-grep)', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    // Local engine path.
+    expect(source).toMatch(/await checkGraphSignalsCoverage\(engine\)/);
+    // Remote/JSON path heartbeat.
+    expect(source).toContain("progress.heartbeat('graph_signals_coverage')");
   });
 });
