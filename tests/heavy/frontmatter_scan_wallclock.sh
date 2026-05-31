@@ -132,8 +132,18 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 0
 fi
 
-FM_STATUS=$(jq -r '.checks[] | select(.name=="frontmatter_integrity") | .status' "$LOG.doctor")
-FM_MSG=$(jq -r '.checks[] | select(.name=="frontmatter_integrity") | .message' "$LOG.doctor")
+# doctor --json now emits progress lines before the JSON payload; peel off the
+# final JSON line so jq sees valid input on all versions.
+DOCTOR_JSON="$LOG.doctor.json"
+grep -E '^\{' "$LOG.doctor" | tail -1 > "$DOCTOR_JSON"
+if [ ! -s "$DOCTOR_JSON" ]; then
+  echo "[fm_wallclock] FAIL: could not find JSON payload in doctor output" >&2
+  tail -30 "$LOG.doctor" >&2
+  exit 1
+fi
+
+FM_STATUS=$(jq -r '.checks[] | select(.name=="frontmatter_integrity") | .status' "$DOCTOR_JSON")
+FM_MSG=$(jq -r '.checks[] | select(.name=="frontmatter_integrity") | .message' "$DOCTOR_JSON")
 echo "[fm_wallclock] frontmatter_integrity: status=$FM_STATUS msg=$FM_MSG" | tee -a "$LOG"
 
 if [ "$FM_STATUS" != "ok" ]; then
