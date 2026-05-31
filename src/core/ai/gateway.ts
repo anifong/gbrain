@@ -107,7 +107,7 @@ const MAX_CHARS = 8000;
 export { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './defaults.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './defaults.ts';
 const DEFAULT_EXPANSION_MODEL = 'anthropic:claude-haiku-4-5-20251001';
-const DEFAULT_CHAT_MODEL = 'anthropic:claude-sonnet-4-6';
+const DEFAULT_CHAT_MODEL = 'google:gemini-2.5-flash';
 // v0.35.0.0+: reranker default. Used only when search.reranker.enabled is set
 // AND no explicit reranker_model is configured. Mode bundles' per-mode
 // `reranker_model` default to this same value but can be overridden.
@@ -2625,11 +2625,11 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   const tools = (opts.tools ?? []).reduce((acc, t) => {
     acc[t.name] = {
       description: t.description,
-      // AI SDK v6 requires a Schema (carrying the schema symbol), not a plain
-      // `{jsonSchema}` object — the bare object makes asSchema() treat it as a
-      // thunk and call schema(), throwing "schema is not a function". Wrap the
-      // raw JSON Schema with the SDK's jsonSchema() helper so tool calls work
-      // through the real toolLoop (skillopt rollouts + subagent jobs).
+      // AI SDK v6 expects a Schema object (or schema factory). Passing a raw
+      // plain object here makes asSchema() call `schema()` and throw
+      // "schema is not a function" at runtime. Wrap the raw JSON Schema with
+      // the SDK's jsonSchema() helper so tool calls work through the real
+      // toolLoop (skillopt rollouts + subagent jobs).
       inputSchema: jsonSchema(t.inputSchema as any),
     };
     return acc;
