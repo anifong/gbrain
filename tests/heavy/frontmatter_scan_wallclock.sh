@@ -80,7 +80,8 @@ echo "[fm_wallclock] fixture seeded in ${SEED_ELAPSED}s" | tee -a "$LOG"
 
 # Step 2: init brain + register the source.
 echo "[fm_wallclock] init brain..." | tee -a "$LOG"
-timeout 120s bun run src/cli.ts init --pglite --yes >> "$LOG" 2>&1 || {
+# Keep this test self-contained: no embedding key requirement in CI/local heavy runs.
+timeout 120s bun run src/cli.ts init --pglite --no-embedding --yes >> "$LOG" 2>&1 || {
   echo "[fm_wallclock] FAIL: gbrain init exited non-zero" >&2
   echo "Log tail:" >&2
   tail -30 "$LOG" >&2
