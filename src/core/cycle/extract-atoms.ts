@@ -70,6 +70,8 @@ const EXTRACTABLE_PAGE_TYPES = [
 ] as const;
 const PAGE_DISCOVERY_BUDGET = 50;
 const MIN_PAGE_CHARS_FOR_EXTRACTION = 500;
+const NO_ATOMS_HASH_FRONTMATTER_KEY = 'atom_extraction_no_atoms_hash';
+const NO_ATOMS_AT_FRONTMATTER_KEY = 'atom_extraction_no_atoms_at';
 
 export interface ExtractAtomsOpts {
   brainDir?: string;
@@ -180,6 +182,7 @@ export async function discoverExtractablePages(
       AND p.content_hash IS NOT NULL
       AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
       AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
+      AND COALESCE(p.frontmatter->>'${NO_ATOMS_HASH_FRONTMATTER_KEY}', '') <> substring(p.content_hash from 1 for 16)
       AND length(COALESCE(p.compiled_truth, '')) >= $3
       ${hasFilter ? "AND p.slug = ANY($5::text[])" : ''}
       AND NOT EXISTS (
@@ -252,6 +255,7 @@ export async function countExtractAtomsBacklog(
            AND p.content_hash IS NOT NULL
            AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
            AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
+           AND COALESCE(p.frontmatter->>'${NO_ATOMS_HASH_FRONTMATTER_KEY}', '') <> substring(p.content_hash from 1 for 16)
            AND length(COALESCE(p.compiled_truth, '')) >= $3
            AND NOT EXISTS (
              SELECT 1 FROM pages atom
@@ -265,6 +269,7 @@ export async function countExtractAtomsBacklog(
            AND p.content_hash IS NOT NULL
            AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
            AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
+           AND COALESCE(p.frontmatter->>'${NO_ATOMS_HASH_FRONTMATTER_KEY}', '') <> substring(p.content_hash from 1 for 16)
            AND length(COALESCE(p.compiled_truth, '')) >= $2
            AND NOT EXISTS (
              SELECT 1 FROM pages atom
@@ -321,6 +326,46 @@ export async function atomsExistingForHashes(
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[extract_atoms] batch idempotency check failed (assuming none extracted): ${msg}`);
     return new Set();
+  }
+}
+
+async function markPageNoAtomsForHash(
+  engine: BrainEngine,
+  sourceId: string,
+  page: { slug: string; contentHash: string },
+): Promise<void> {
+  const hash16 = page.contentHash.slice(0, 16);
+  try {
+    await engine.executeRaw(
+      `UPDATE pages
+          SET frontmatter = jsonb_set(
+                jsonb_set(
+                  COALESCE(frontmatter, '{}'::jsonb),
+                  ARRAY[$1],
+                  to_jsonb($2::text),
+                  true
+                ),
+                ARRAY[$3],
+                to_jsonb($4::text),
+                true
+              )
+        WHERE source_id = $5
+          AND slug = $6
+          AND content_hash = $7
+          AND deleted_at IS NULL`,
+      [
+        NO_ATOMS_HASH_FRONTMATTER_KEY,
+        hash16,
+        NO_ATOMS_AT_FRONTMATTER_KEY,
+        new Date().toISOString(),
+        sourceId,
+        page.slug,
+        page.contentHash,
+      ],
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[extract_atoms] no-atoms marker failed for ${page.slug}: ${msg}`);
   }
 }
 
@@ -510,8 +555,14 @@ export async function runPhaseExtractAtoms(
 
       const atoms = parseAtomsResponse(result.text);
       if (atoms.length === 0) {
-        if (item.kind === 'transcript') transcriptsProcessed++;
-        else pagesProcessed++;
+        if (item.kind === 'transcript') {
+          transcriptsProcessed++;
+        } else {
+          pagesProcessed++;
+          if (!opts.dryRun) {
+            await markPageNoAtomsForHash(engine, sourceId, item);
+          }
+        }
         continue;
       }
 

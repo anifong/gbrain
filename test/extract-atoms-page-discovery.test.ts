@@ -17,6 +17,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   runPhaseExtractAtoms,
   discoverExtractablePages,
+  countExtractAtomsBacklog,
 } from '../src/core/cycle/extract-atoms.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import type { ChatOpts, ChatResult } from '../src/core/ai/gateway.ts';
@@ -354,6 +355,39 @@ describe('v0.41.2.1: runPhaseExtractAtoms — dual-source merge + idempotency', 
     expect(result.details?.pages_skipped_budget).toBe(0);
     expect(result.details?.duplicates_skipped).toBe(0);
     expect(result.details?.atoms_extracted).toBe(2);
+  });
+
+  test('empty atom response marks page hash as no-atoms so backlog can progress', async () => {
+    await seedPage({ slug: 'meeting/no-atoms', type: 'meeting', content_hash: 'emptyhash1234567890' });
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _chat: stubChat('[]'),
+    });
+    expect(result.details?.atoms_extracted).toBe(0);
+    expect(result.details?.pages_processed).toBe(1);
+
+    const pageRows = await engine.executeRaw<{ frontmatter: Record<string, unknown> }>(
+      `SELECT frontmatter FROM pages WHERE slug = 'meeting/no-atoms'`,
+    );
+    expect(pageRows[0].frontmatter.atom_extraction_no_atoms_hash).toBe('emptyhash1234567');
+
+    const discovered = await discoverExtractablePages(engine, 'default');
+    expect(discovered.map((d) => d.slug)).toEqual([]);
+    await expect(countExtractAtomsBacklog(engine, 'default')).resolves.toBe(0);
+  });
+
+  test('dry-run empty atom response does not mark source page', async () => {
+    await seedPage({ slug: 'meeting/no-atoms-dry', type: 'meeting', content_hash: 'dryemptyhash123456' });
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _chat: stubChat('[]'),
+      dryRun: true,
+    });
+    expect(result.details?.atoms_extracted).toBe(0);
+    expect(result.details?.pages_processed).toBe(1);
+
+    const discovered = await discoverExtractablePages(engine, 'default');
+    expect(discovered.map((d) => d.slug)).toEqual(['meeting/no-atoms-dry']);
   });
 
   test('dry-run skips putPage for atoms', async () => {
