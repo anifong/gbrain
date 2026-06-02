@@ -326,6 +326,19 @@ class ProposeTakesPhase extends BaseCyclePhase {
     };
     const pages: Page[] = await engine.listPages(pageFilters);
 
+    if (opts.dryRun) {
+      return {
+        summary: `dry-run: propose_takes would scan ${pages.length} page(s); no LLM calls or writes`,
+        details: {
+          ...result,
+          pages_scanned: pages.length,
+          dryRun: true,
+          prompt_version: promptVersion,
+        },
+        status: 'ok',
+      };
+    }
+
     if (opts.reporter) {
       opts.reporter.start('propose_takes.pages' as never, pages.length);
     }

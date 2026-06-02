@@ -265,6 +265,30 @@ describe('runPhaseProposeTakes — phase integration', () => {
     expect(inserts[0]!.params[9]).toBe('market'); // domain
   });
 
+  test('dry-run previews page count without extractor calls or writes', async () => {
+    const pages = [
+      buildPage({ slug: 'wiki/a', body: 'page A prose' }),
+      buildPage({ slug: 'wiki/b', body: 'page B prose' }),
+    ];
+    const { engine, captured } = buildMockEngine({ pages });
+    let extractorCalls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      extractorCalls++;
+      return [{ claim_text: 'should not happen', kind: 'take', holder: 'brain', weight: 0.5 }];
+    };
+
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor, dryRun: true });
+
+    expect(result.status).toBe('ok');
+    expect(result.summary).toContain('dry-run');
+    const details = result.details as Record<string, unknown>;
+    expect(details.pages_scanned).toBe(2);
+    expect(details.proposals_inserted).toBe(0);
+    expect(details.dryRun).toBe(true);
+    expect(extractorCalls).toBe(0);
+    expect(captured).toHaveLength(0);
+  });
+
   test('cache hit: page already in take_proposals is skipped', async () => {
     const body = 'A page that was already processed.';
     const pages = [buildPage({ slug: 'wiki/old-page', body })];
