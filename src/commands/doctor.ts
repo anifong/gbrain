@@ -6061,16 +6061,32 @@ export async function buildChecks(
   if (engine) {
     progress.heartbeat('image_assets');
     try {
-      const rows = await engine.executeRaw<{ storage_path: string }>(
-        `SELECT storage_path FROM files WHERE mime_type LIKE 'image/%' LIMIT 1000`
+      const rows = await engine.executeRaw<{ storage_path: string; source_local_path: string | null }>(
+        `SELECT f.storage_path, s.local_path AS source_local_path
+         FROM files f
+         LEFT JOIN sources s ON s.id = f.source_id
+         WHERE f.mime_type LIKE 'image/%'
+         LIMIT 1000`
       );
       let vanished = 0;
       const vanishedPaths: string[] = [];
       const fs = await import('node:fs');
       for (const r of rows) {
-        try {
-          fs.statSync(r.storage_path);
-        } catch {
+        const candidates = isAbsolute(r.storage_path)
+          ? [r.storage_path]
+          : [
+              r.storage_path,
+              ...(r.source_local_path ? [join(r.source_local_path, r.storage_path)] : []),
+            ];
+        const present = candidates.some((candidate) => {
+          try {
+            fs.statSync(candidate);
+            return true;
+          } catch {
+            return false;
+          }
+        });
+        if (!present) {
           vanished++;
           if (vanishedPaths.length < 5) vanishedPaths.push(r.storage_path);
         }
