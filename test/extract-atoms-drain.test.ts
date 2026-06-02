@@ -76,6 +76,23 @@ describe('runExtractAtomsDrain (issue #1678)', () => {
     expect(result.remaining).toBe(5);
   });
 
+  it('stops when skipped-only batches leave the backlog unchanged', async () => {
+    let batches = 0;
+    const result = await runExtractAtomsDrain(
+      {
+        withLock: passThroughLock,
+        countRemaining: async () => 56,
+        runBatch: async () => { batches++; return { extracted: 0, skipped: 592 }; },
+        now: () => 0,
+      },
+      { windowMs: 1_000_000, maxBatches: 10 },
+    );
+    expect(result.stopped).toBe('no_progress');
+    expect(batches).toBe(1);
+    expect(result.skipped).toBe(592);
+    expect(result.remaining).toBe(56);
+  });
+
   it('propagates a busy-lock error (caller reports cycle_already_running)', async () => {
     class FakeBusy extends Error {}
     await expect(

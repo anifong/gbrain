@@ -84,9 +84,15 @@ export async function runExtractAtomsDrain(
       deps.onBatch?.({ batch: batches, extracted: r.extracted, remaining: before });
 
       // Stop if a batch made zero forward progress — extraction is failing or
-      // everything left is ineligible (e.g. all skipped). Prevents a hot loop
-      // that spends budget without draining.
+      // everything left is ineligible. A skipped-only batch can still be a hot
+      // loop if the backlog count does not move, so verify that shape instead
+      // of treating `skipped > 0` as useful work.
       if (r.extracted === 0 && r.skipped === 0) { stopped = 'no_progress'; break; }
+      if (r.extracted === 0 && r.skipped > 0 && before !== null) {
+        const after = await deps.countRemaining();
+        if (after === 0) { stopped = 'drained'; break; }
+        if (after !== null && after >= before) { stopped = 'no_progress'; break; }
+      }
     }
 
     const remaining = await deps.countRemaining();
