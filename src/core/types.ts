@@ -608,6 +608,13 @@ export interface StalePageRow {
   timeline: string;
   frontmatter: Record<string, unknown>;
   updated_at: Date;
+  /**
+   * Raw DB timestamp text for `updated_at`, preserving Postgres microseconds.
+   * JavaScript Date truncates to milliseconds; `extract --stale` uses this as
+   * the exact watermark stamp so `updated_at > links_extracted_at` does not stay
+   * true by a few hundred microseconds forever.
+   */
+  updated_at_raw: string;
 }
 
 export interface ChunkInput {

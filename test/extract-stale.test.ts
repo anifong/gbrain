@@ -119,6 +119,39 @@ describe('gbrain extract --stale', () => {
     expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
   });
 
+  test('version-arm regression: old pages are stamped at least to extractor version', async () => {
+    await engine.putPage('people/archive', personPage('Archive', 'No links here.'));
+    await engine.executeRaw(
+      `UPDATE pages
+         SET updated_at = '2000-01-01T00:00:00Z',
+             links_extracted_at = NULL
+       WHERE slug = 'people/archive'`,
+    );
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(1);
+
+    await runExtract(engine, ['--stale']);
+
+    const stamp = await stampOf('people/archive');
+    expect(stamp).not.toBeNull();
+    expect(new Date(stamp!).getTime()).toBeGreaterThanOrEqual(new Date(LINK_EXTRACTOR_VERSION_TS).getTime());
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+  });
+
+  test('timestamp precision regression: microsecond updated_at is not rounded stale forever', async () => {
+    await engine.putPage('people/precise', personPage('Precise', 'No links here.'));
+    await engine.executeRaw(
+      `UPDATE pages
+         SET updated_at = '2026-06-02T11:01:31.426614Z',
+             links_extracted_at = NULL
+       WHERE slug = 'people/precise'`,
+    );
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(1);
+
+    await runExtract(engine, ['--stale']);
+
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+  });
+
   test('idempotent: second run finds 0 stale and creates no new links', async () => {
     await engine.putPage('people/alice', personPage('Alice'));
     await engine.putPage('companies/acme', companyPage('Acme', '[Alice](people/alice) advises [Acme](companies/acme).'));

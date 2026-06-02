@@ -1527,11 +1527,25 @@ async function extractStaleFromDB(
         timelineRows.push({ slug: page.slug, date: entry.date, summary: entry.summary, detail: entry.detail || '', source_id: page.source_id });
       }
       // EVERY processed page is stamped (incl. zero-link pages). D4 race fix:
-      // stamp with the row's READ updated_at, NOT now() — a concurrent edit
+      // stamp from the row's READ updated_at, NOT now() — a concurrent edit
       // landing between this SELECT and the stamp advances updated_at past the
       // stamped value, so the page stays stale and re-extracts next run instead
       // of being marked fresh-with-stale-content.
-      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: page.updated_at.toISOString() });
+      //
+      // v0.42.8 downstream fix: the stale predicate also has a version arm
+      // (`links_extracted_at < LINK_EXTRACTOR_VERSION_TS`). Old pages whose
+      // read updated_at predates the extractor version must stamp at least to
+      // version, or `extract --stale` processes them forever. This still
+      // preserves D4: any real concurrent edit lands after LINK_EXTRACTOR_VERSION_TS
+      // and remains newer than this stamp.
+      //
+      // Use updated_at_raw when it wins, not updated_at.toISOString(): Postgres
+      // stores microseconds but JS Date truncates to milliseconds. Stamping the
+      // truncated Date leaves updated_at > links_extracted_at by sub-ms dust.
+      const readUpdatedAtMs = page.updated_at.getTime();
+      const versionMs = new Date(versionTs).getTime();
+      const extractedAt = readUpdatedAtMs >= versionMs ? page.updated_at_raw : versionTs;
+      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt });
     }
 
     // Flush NON-swallowing (CDX-4): a throw here propagates out of the sweep so
