@@ -100,6 +100,13 @@ describe('aliasDeclaredByTwoTypes', () => {
 });
 
 describe('aliasReferencesUndeclaredType', () => {
+  it('clean: aliases may be free-form legacy type names for canonical back-compat', async () => {
+    const m = mk({ page_types: [
+      baseType({ name: 'media', aliases: ['article', 'video', 'podcast-episode'] }),
+    ] });
+    expect(await aliasReferencesUndeclaredType(m)).toEqual([]);
+  });
+
   it('clean: aliases all match declared types', async () => {
     const m = mk({ page_types: [
       baseType({ name: 'person' }),
@@ -108,17 +115,14 @@ describe('aliasReferencesUndeclaredType', () => {
     expect(await aliasReferencesUndeclaredType(m)).toEqual([]);
   });
 
-  it('flags alias pointing at undeclared type', async () => {
+  it('retired: does not warn on aliases that are not declared page types', async () => {
     const m = mk({ page_types: [baseType({ name: 'r', aliases: ['ghost'] })] });
-    const issues = await aliasReferencesUndeclaredType(m);
-    expect(issues.length).toBe(1);
-    expect(issues[0]!.severity).toBe('warning');
-    expect(issues[0]!.message).toContain('ghost');
+    expect(await aliasReferencesUndeclaredType(m)).toEqual([]);
   });
 
-  it('flags multiple undeclared references separately', async () => {
+  it('retired: does not warn on multiple free-form aliases', async () => {
     const m = mk({ page_types: [baseType({ name: 'r', aliases: ['g1', 'g2'] })] });
-    expect((await aliasReferencesUndeclaredType(m)).length).toBe(2);
+    expect(await aliasReferencesUndeclaredType(m)).toEqual([]);
   });
 });
 
