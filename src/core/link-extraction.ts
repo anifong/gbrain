@@ -475,11 +475,11 @@ export async function extractPageLinks(
   for (const ref of extractEntityRefs(content)) {
     // Issue #972: refs from the generic `[[bare-name]]` pass carry the
     // literal wikilink text, not a real page slug. When global_basename
-    // mode is on AND the resolver implements basename lookup, resolve
-    // to every matching page and emit one candidate per match. When the
-    // flag is off (default), drop silently — back-compat with the
-    // pre-v0.40.8.2 behavior of dropping bare wikilinks outside
-    // DIR_PATTERN.
+    // mode is on AND the resolver implements basename lookup, resolve to one
+    // safe, unambiguous page. Ambiguous basename matches are dropped rather
+    // than spraying noisy edges across every same-tail page. When the flag is
+    // off (default), drop silently — back-compat with the pre-v0.40.8.2
+    // behavior of dropping bare wikilinks outside DIR_PATTERN.
     if (ref.needsResolution) {
       if (!opts.globalBasename || typeof resolver.resolveBasenameMatches !== 'function') {
         continue;
@@ -489,20 +489,18 @@ export async function extractPageLinks(
       // (ref.name = match[2]). `[[struktura|the project]]` must resolve
       // `struktura`, not "the project". The display text is for context only.
       const matches = await resolver.resolveBasenameMatches(ref.slug);
-      if (matches.length === 0) continue;
+      const safeMatches = matches.filter(matched =>
+        matched !== slug && !isUnsafeBasenameResolutionTarget(matched),
+      );
+      if (safeMatches.length !== 1) continue;
       const idx = content.indexOf(ref.slug);
       const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
-      for (const matched of matches) {
-        // Issue #972 (codex [P2]): a basename `[[own-tail]]` on its own page
-        // resolves back to itself — drop the self-loop.
-        if (matched === slug) continue;
-        candidates.push({
-          targetSlug: matched,
-          linkType: WIKILINK_BASENAME_LINK_TYPE,
-          context,
-          linkSource: 'wikilink-resolved',
-        });
-      }
+      candidates.push({
+        targetSlug: safeMatches[0],
+        linkType: WIKILINK_BASENAME_LINK_TYPE,
+        context,
+        linkSource: 'wikilink-resolved',
+      });
       continue;
     }
     const idx = content.indexOf(ref.name);
@@ -830,6 +828,15 @@ function basenameSort(a: string, b: string): number {
   return (a.length - b.length) || a.localeCompare(b);
 }
 
+/**
+ * Exclude generated/staging slugs from global-basename resolution. Bare
+ * wikilinks should attach to canonical knowledge pages, not test fixtures or
+ * orphan-index scaffolding pages that happen to share the same tail.
+ */
+export function isUnsafeBasenameResolutionTarget(slug: string): boolean {
+  return slug.startsWith('test/') || slug.includes('/orphan-index/');
+}
+
 /** Build a `key → slug[]` index over a slug collection. Keys: raw/lower/slugified tail. */
 export function buildBasenameIndex(slugs: Iterable<string>): Map<string, string[]> {
   const idx = new Map<string, string[]>();
@@ -855,7 +862,11 @@ export function queryBasenameIndex(idx: Map<string, string[]>, name: string): st
   const trimmed = name.trim();
   if (!trimmed) return [];
   const hit = idx.get(trimmed) ?? idx.get(trimmed.toLowerCase()) ?? idx.get(normalizeBasename(trimmed));
-  return hit ? [...hit].sort(basenameSort) : [];
+  if (!hit) return [];
+  const safeHits = [...hit]
+    .filter(slug => !isUnsafeBasenameResolutionTarget(slug))
+    .sort(basenameSort);
+  return safeHits.length === 1 ? safeHits : [];
 }
 
 /**
