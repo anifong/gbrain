@@ -994,6 +994,8 @@ export interface BrainEngine {
    * to call embedBatch + upsertChunks. The `embedding` column is omitted
    * by design — stale rows have NULL embeddings, so shipping them wastes
    * wire bytes for no gain. Caller groups by slug, embeds, and re-upserts.
+   * Rows include source_id so multi-source brains can re-fetch and upsert
+   * into the correct source when duplicate slugs exist.
    *
    * v0.33.3: cursor-paginated — yields up to `batchSize` rows per call
    * (default 2000) to stay within Supabase's statement_timeout. Pass the

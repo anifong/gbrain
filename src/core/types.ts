@@ -579,13 +579,13 @@ export interface Chunk {
  */
 export interface StaleChunkRow {
   slug: string;
+  /** v0.31.12: source_id so embed --stale can thread it through getChunks/upsertChunks. */
+  source_id: string;
   chunk_index: number;
   chunk_text: string;
   chunk_source: 'compiled_truth' | 'timeline';
   model: string | null;
   token_count: number | null;
-  /** v0.31.12: source_id so embed --stale can thread it through getChunks/upsertChunks. */
-  source_id: string;
   /** v0.33.3: page_id for cursor pagination in listStaleChunks. */
   page_id: number;
 }

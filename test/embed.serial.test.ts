@@ -14,6 +14,9 @@ let lastEmbedBatchOpts: unknown = undefined;
 let embedBatchBehavior: ((texts: string[], opts?: unknown) => Promise<Float32Array[]>) | null = null;
 
 mock.module('../src/core/embedding.ts', () => ({
+  embed: async (_text: string) => new Float32Array(1536),
+  embedQuery: async (_text: string) => new Float32Array(1536),
+  embedMultimodal: async (inputs: unknown[]) => inputs.map(() => new Float32Array(1024)),
   embedBatch: async (texts: string[], opts?: unknown) => {
     activeEmbedCalls++;
     totalEmbedCalls++;
@@ -37,6 +40,12 @@ mock.module('../src/core/embedding.ts', () => ({
   // setPageEmbeddingSignature / invalidateStaleSignatureEmbeddings resolve to
   // null via the Proxy default, so the signature value is inert here.
   currentEmbeddingSignature: () => 'test:model:1536',
+  getEmbeddingModelName: () => 'text-embedding-3-large',
+  getEmbeddingDimensions: () => 1536,
+  EMBEDDING_MODEL: 'text-embedding-3-large',
+  EMBEDDING_DIMENSIONS: 1536,
+  EMBEDDING_COST_PER_1K_TOKENS: 0.00013,
+  estimateEmbeddingCostUsd: (tokens: number) => (tokens / 1000) * 0.00013,
 }));
 
 // Import AFTER mocking.
@@ -407,6 +416,42 @@ describe('runEmbedCore --stale egress fix (SQL-side filter)', () => {
     const staleChunkInUpsert = pageBUpsert!.chunks.find((c: any) => c.chunk_index === 1);
     expect(staleChunkInUpsert.embedding).toBeDefined();
     expect(staleChunkInUpsert.embedding).toBeInstanceOf(Float32Array);
+  });
+
+  test('duplicate stale slugs in different sources are re-fetched and upserted source-scoped', async () => {
+    const { runEmbedCore } = await import('../src/commands/embed.ts');
+
+    const stale = [
+      { slug: 'same-slug', source_id: 'default', page_id: 1, chunk_index: 0, chunk_text: 'default text', chunk_source: 'compiled_truth' as const, model: null, token_count: null },
+      { slug: 'same-slug', source_id: 'vault', page_id: 2, chunk_index: 0, chunk_text: 'vault text', chunk_source: 'compiled_truth' as const, model: null, token_count: null },
+    ];
+    const getChunkCalls: Array<{ slug: string; opts?: { sourceId?: string } }> = [];
+    const upsertCalls: Array<{ slug: string; opts?: { sourceId?: string } }> = [];
+
+    const engine = mockEngine({
+      countStaleChunks: async () => 2,
+      listStaleChunks: async () => stale,
+      getChunks: async (slug: string, opts?: { sourceId?: string }) => {
+        getChunkCalls.push({ slug, opts });
+        return [{ chunk_index: 0, chunk_text: `${opts?.sourceId} text`, chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 }];
+      },
+      upsertChunks: async (slug: string, _chunks: any[], opts?: { sourceId?: string }) => {
+        upsertCalls.push({ slug, opts });
+      },
+    });
+
+    const result = await runEmbedCore(engine, { stale: true });
+
+    expect(result.embedded).toBe(2);
+    expect(result.pages_processed).toBe(2);
+    expect(getChunkCalls.map(c => [c.slug, c.opts?.sourceId]).sort()).toEqual([
+      ['same-slug', 'default'],
+      ['same-slug', 'vault'],
+    ]);
+    expect(upsertCalls.map(c => [c.slug, c.opts?.sourceId]).sort()).toEqual([
+      ['same-slug', 'default'],
+      ['same-slug', 'vault'],
+    ]);
   });
 
   test('--stale dry-run: counts stale via countStaleChunks (no listStaleChunks call), no embedBatch or upsertChunks', async () => {
