@@ -119,6 +119,70 @@ describe('Bug 11 — orphan_pages is "no inbound links"', () => {
   });
 });
 
+describe('BrainHealth stale_pages', () => {
+  test('timeline write time does not make a synced page stale', async () => {
+    await engine.putPage('timeline-page', {
+      type: 'note',
+      title: 'Timeline Page',
+      compiled_truth: 'content',
+      frontmatter: {},
+    });
+    const pageId = (await (engine as any).db.query(`SELECT id FROM pages WHERE slug='timeline-page'`)).rows[0].id;
+    await (engine as any).db.query(
+      `INSERT INTO content_chunks (page_id, chunk_index, chunk_text, embedding, embedded_at, created_at) VALUES ($1, 0, 'content', NULL, now(), now())`,
+      [pageId],
+    );
+    await (engine as any).db.query(
+      `INSERT INTO timeline_entries (page_id, date, summary, source) VALUES ($1, '2026-06-03', 'Captured later', 'test')`,
+      [pageId],
+    );
+
+    const h = await engine.getHealth();
+    expect(h.stale_pages).toBe(0);
+  });
+
+  test('missing chunk embeddings still make a page stale', async () => {
+    await engine.putPage('missing-embed-page', {
+      type: 'note',
+      title: 'Missing Embed Page',
+      compiled_truth: 'content',
+      frontmatter: {},
+    });
+    const pageId = (await (engine as any).db.query(`SELECT id FROM pages WHERE slug='missing-embed-page'`)).rows[0].id;
+    await (engine as any).db.query(
+      `INSERT INTO content_chunks (page_id, chunk_index, chunk_text, embedding, embedded_at, created_at) VALUES ($1, 0, 'content', NULL, NULL, now())`,
+      [pageId],
+    );
+
+    const h = await engine.getHealth();
+    expect(h.stale_pages).toBe(1);
+  });
+
+  test('accepted non-embeddables do not make sync look stale', async () => {
+    await engine.putPage('atom-page', {
+      type: 'atom',
+      title: 'Atom Page',
+      compiled_truth: 'small extracted atom',
+      frontmatter: {},
+    });
+    await engine.putPage('oversized-page', {
+      type: 'note',
+      title: 'Oversized Page',
+      compiled_truth: 'oversized but explicitly skipped',
+      frontmatter: { embed_skip: { reason: 'oversized', bytes: 999999, assessed_at: '2026-06-03T00:00:00.000Z' } },
+    });
+    await engine.putPage('empty-page', {
+      type: 'note',
+      title: 'Empty Page',
+      compiled_truth: '',
+      frontmatter: {},
+    });
+
+    const h = await engine.getHealth();
+    expect(h.stale_pages).toBe(0);
+  });
+});
+
 describe('Bug 11 — doctor renders brain_score breakdown', () => {
   test('doctor source contains brain_score breakdown rendering', async () => {
     const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();

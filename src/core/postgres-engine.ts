@@ -4546,7 +4546,16 @@ export class PostgresEngine implements BrainEngine {
         (SELECT count(*) FROM content_chunks WHERE embedded_at IS NOT NULL)::float /
           GREATEST((SELECT count(*) FROM content_chunks), 1)::float as embed_coverage,
         (SELECT count(*) FROM pages p
-         WHERE p.updated_at < (SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id)
+         WHERE p.type <> 'atom'
+           AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
+           AND length(trim(COALESCE(p.compiled_truth, ''))) > 0
+           AND (
+             NOT EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id = p.id)
+             OR EXISTS (
+               SELECT 1 FROM content_chunks c
+               WHERE c.page_id = p.id AND c.embedded_at IS NULL
+             )
+           )
         ) as stale_pages,
         (SELECT count(*) FROM pages p
          WHERE NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
