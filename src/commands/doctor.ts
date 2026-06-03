@@ -227,6 +227,36 @@ function _penaltyScore(checks: Check[]): number {
  * categorizer is the single source of truth in
  * `src/core/doctor-categories.ts`.
  */
+export function hnswIndexStatusForEmbeddingColumn(input: {
+  engineKind: string;
+  column: string;
+  type: string;
+  dimensions: number;
+  hasIndex: boolean;
+  quoteIdentifier?: (name: string) => string;
+}): { status: 'ok' | 'warn'; message?: string } {
+  if (input.engineKind !== 'postgres' || input.hasIndex) return { status: 'ok' };
+
+  // pgvector HNSW supports up to 2000 dimensions for vector and 4000 for
+  // halfvec. Above that, exact scan is expected; recommending CREATE INDEX is
+  // an impossible fix for 2560-dim providers such as ZeroEntropy zembed-1.
+  const hnswLimit = input.type === 'halfvec' ? 4000 : 2000;
+  if (input.dimensions > hnswLimit) {
+    return {
+      status: 'ok',
+      message: `${input.column}: HNSW unsupported for ${input.dimensions} dimensions (${input.type} limit ${hnswLimit}); exact scan is expected.`,
+    };
+  }
+
+  const quote = input.quoteIdentifier ?? ((name: string) => `"${name.replaceAll('"', '""')}"`);
+  return {
+    status: 'warn',
+    message:
+      `${input.column}: no HNSW index. Search works but uses sequential scan. ` +
+      `Fix: CREATE INDEX IF NOT EXISTS idx_chunks_${input.column} ON content_chunks USING hnsw (${quote(input.column)} ${input.type}_cosine_ops);`,
+  };
+}
+
 export function computeDoctorReport(checks: Check[]): DoctorReport {
   const tagged = checks.map((c) =>
     c.category ? c : { ...c, category: categorizeCheck(c.name) },
@@ -5275,12 +5305,23 @@ export async function buildChecks(
           );
           continue;
         }
-        if (engine.kind === 'postgres' && haveIndex.get(colName) === false) {
-          issues.push(
-            `${colName}: no HNSW index. Search works but uses sequential scan. ` +
-              `Fix: CREATE INDEX IF NOT EXISTS idx_chunks_${colName} ON content_chunks USING hnsw (${quoteIdentifier(colName)} ${entry.type}_cosine_ops);`,
-          );
-          continue;
+        if (engine.kind === 'postgres') {
+          const indexStatus = hnswIndexStatusForEmbeddingColumn({
+            engineKind: engine.kind,
+            column: colName,
+            type: entry.type,
+            dimensions: entry.dimensions,
+            hasIndex: haveIndex.get(colName) === true,
+            quoteIdentifier,
+          });
+          if (indexStatus.status === 'warn' && indexStatus.message) {
+            issues.push(indexStatus.message);
+            continue;
+          }
+          if (indexStatus.message) {
+            okColumns.push(`${colName} (${indexStatus.message})`);
+            continue;
+          }
         }
         okColumns.push(colName);
       }
