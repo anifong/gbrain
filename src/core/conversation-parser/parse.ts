@@ -324,7 +324,7 @@ export function applyPattern(
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
     const line = rawLine.trim();
-    if (!line) continue;
+    if (!line || line === '>') continue;
 
     // Quick-reject fast path.
     if (entry.quick_reject && !entry.quick_reject.test(line)) {
@@ -495,7 +495,7 @@ export function parseConversation(
     // attempts" (Codex P2 #7).
   }
 
-  const top = scored[0];
+  let top = scored[0];
   const patternsScored = scored.length;
 
   // v0.41.29.0 (Codex F1): broad no-time patterns (`bold-name-no-time`,
@@ -511,6 +511,17 @@ export function parseConversation(
   // stays ~1.0; a 3/200-label notes page drops to ~0.015 → no_match).
   if (top.entry.score_full_body && !fullBodyScored) {
     top.score = scoreFromLines(getNonBlankLines(body), top.entry);
+    if (top.score < SCORING_MIN_ACCEPTANCE) {
+      const allLines = getNonBlankLines(body);
+      scored = candidates.map((entry) => ({
+        entry,
+        score: scoreFromLines(allLines, entry),
+        priority: priorityOf(entry.id),
+      }));
+      sortScored(scored);
+      top = scored[0];
+      fullBodyScored = true;
+    }
   }
 
   // Minimum acceptance floor (closes Codex P1 #2): an essay with

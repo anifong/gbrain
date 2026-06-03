@@ -136,6 +136,51 @@ export interface DoctorReport {
   top_issues?: RankedIssue[];
 }
 
+/**
+ * Doctor's conversation-format coverage check should measure transcript-like
+ * pages, not every page whose schema type happens to be `meeting`. Obsidian
+ * vaults often store prose meeting notes and generated index pages under that
+ * type; counting those as parser failures makes the coverage warning noisy.
+ *
+ * Keep this predicate intentionally conservative: explicit transcript headers
+ * are candidates, as are bodies with multiple timestamped chat-line anchors.
+ * Plain bold metadata (`**Date:**`, `**Attendees:**`, `**Goal:**`) is not.
+ */
+export function isPotentialConversationTranscriptBody(
+  page: { slug?: string | null },
+  body: string,
+): boolean {
+  const slug = (page.slug ?? '').toLowerCase();
+  if (/\/(orphan-index|index)$/.test(slug)) return false;
+
+  const lines = body
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return false;
+
+  if (
+    lines.some(
+      (line) =>
+        /^(?:>\s*)?(?:#{1,6}\s+)?(?:full\s+)?transcript\b/i.test(line) ||
+        /^(?:>\s*)?\[![^\]]+\]-?\s*(?:full\s+)?transcript\b/i.test(line),
+    )
+  ) {
+    return true;
+  }
+
+  const timestampedAnchorCount = lines.filter(
+    (line) =>
+      /^>\s*\*\*\[\d{1,2}:\d{2}(?::\d{2})?\]\s+[^:]{1,160}:\*\*/.test(line) ||
+      /^\[\d{1,2}:\d{2}(?::\d{2})?\]\s+\S+/.test(line) ||
+      /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(line) ||
+      /^\d{1,2}\/\d{1,2}\/\d{2,4},?\s+\d{1,2}:\d{2}\s*(?:AM|PM)?\s+-\s+[^:]{1,160}:/.test(line) ||
+      /^\*\*[^*\n]{1,160}\*\*\s+\(\d{1,2}:\d{2}(?::\d{2})?\):/.test(line),
+  ).length;
+
+  return timestampedAnchorCount >= 2;
+}
+
 function _penaltyScore(checks: Check[]): number {
   let score = 100;
   for (const c of checks) {
@@ -4377,34 +4422,51 @@ export async function buildChecks(
       } else {
         const hitsByPattern: Record<string, number> = {};
         let unmatched = 0;
+        let included = 0;
+        let skippedNonTranscript = 0;
         for (const page of sample) {
           const body = `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`.trim();
           const result = parseConversation(body, { page, noPolish: true, noFallback: true });
+          if (result.phase === 'no_match' && !isPotentialConversationTranscriptBody(page, body)) {
+            skippedNonTranscript++;
+            continue;
+          }
+          included++;
           const id = result.matched_pattern_id ?? '_no_match';
           hitsByPattern[id] = (hitsByPattern[id] ?? 0) + 1;
           if (result.phase === 'no_match') unmatched++;
         }
-        const unmatchedPct = (unmatched / sample.length) * 100;
-        const breakdown = Object.entries(hitsByPattern)
-          .sort(([, a], [, b]) => b - a)
-          .map(([k, v]) => `${k}=${v}`)
-          .join(', ');
-        if (unmatchedPct > 10) {
-          checks.push({
-            name: 'conversation_format_coverage',
-            status: 'warn',
-            message:
-              `${unmatched}/${sample.length} conversation pages (${unmatchedPct.toFixed(1)}%) match NO built-in pattern. ` +
-              `Breakdown: ${breakdown}. ` +
-              `Investigate: gbrain conversation-parser scan <slug> | ` +
-              `Enable LLM fallback (opt-in): gbrain config set conversation_parser.llm_fallback_enabled true`,
-          });
-        } else {
+        if (included === 0) {
           checks.push({
             name: 'conversation_format_coverage',
             status: 'ok',
-            message: `${sample.length} pages: ${breakdown}`,
+            message:
+              `No transcript-shaped conversation pages — skipped ${skippedNonTranscript} note/index pages`,
           });
+        } else {
+          const unmatchedPct = (unmatched / included) * 100;
+          const breakdown = Object.entries(hitsByPattern)
+            .sort(([, a], [, b]) => b - a)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(', ');
+          const skippedSuffix = skippedNonTranscript > 0 ? ` Skipped ${skippedNonTranscript} note/index pages.` : '';
+          if (unmatchedPct > 10) {
+            checks.push({
+              name: 'conversation_format_coverage',
+              status: 'warn',
+              message:
+                `${unmatched}/${included} transcript-shaped conversation pages (${unmatchedPct.toFixed(1)}%) match NO built-in pattern. ` +
+                `Breakdown: ${breakdown}.${skippedSuffix} ` +
+                `Investigate: gbrain conversation-parser scan <slug> | ` +
+                `Enable LLM fallback (opt-in): gbrain config set conversation_parser.llm_fallback_enabled true`,
+            });
+          } else {
+            checks.push({
+              name: 'conversation_format_coverage',
+              status: 'ok',
+              message: `${included} transcript-shaped pages: ${breakdown}.${skippedSuffix}`,
+            });
+          }
         }
       }
     } catch (err) {

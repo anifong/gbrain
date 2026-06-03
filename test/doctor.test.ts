@@ -1,6 +1,53 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 
 describe('doctor command', () => {
+  test('conversation coverage candidate filter excludes note/index pages but keeps transcript-shaped bodies', async () => {
+    const { isPotentialConversationTranscriptBody } = await import('../src/commands/doctor.ts');
+    const orphanIndex = '# Orphan Index\n\n- [[work/meetings/a]]\n- [[work/meetings/b]]';
+    expect(
+      isPotentialConversationTranscriptBody({ slug: 'work/meetings/orphan-index' }, orphanIndex),
+    ).toBe(false);
+
+    const proseMeetingNotes = [
+      '# Basic Auth Meeting Notes',
+      '**Date:** 2025-12-24',
+      '**Attendees:** Alice, Bob',
+      '**Goal:** document the basic-auth rollout',
+      'We discussed risks, rollout timing, and next steps.',
+    ].join('\n');
+    expect(
+      isPotentialConversationTranscriptBody(
+        { slug: 'work/meetings/basic-auth-meeting-notes-12-24-25' },
+        proseMeetingNotes,
+      ),
+    ).toBe(false);
+
+    const fathomTranscript = [
+      '# Cloud Talk',
+      '## Transcript',
+      '> [!note]- Full Transcript',
+      '> **[00:00:00] Tami Jones:** Missing?',
+      '>',
+      '> **[00:00:08] Nicole Reints:** Topher and Travis.',
+    ].join('\n');
+    expect(
+      isPotentialConversationTranscriptBody(
+        { slug: 'work/meetings/2026-05-15-cloud-talk' },
+        fathomTranscript,
+      ),
+    ).toBe(true);
+  });
+
+  test('conversation_format_coverage skips no-match pages that are not transcript candidates', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    const block = source.slice(
+      source.indexOf('// 3d.3 v0.41.13.0 — conversation_format_coverage'),
+      source.indexOf('// 3d.4 v0.41.13.0 — progressive_batch_audit_health'),
+    );
+    expect(block).toContain('isPotentialConversationTranscriptBody(page, body)');
+    expect(block).toContain('skippedNonTranscript');
+  });
+
   test('doctor module exports runDoctor', async () => {
     const { runDoctor } = await import('../src/commands/doctor.ts');
     expect(typeof runDoctor).toBe('function');
