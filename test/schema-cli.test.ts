@@ -87,6 +87,21 @@ describe('gbrain schema CLI (Phase C)', () => {
     expect(r.stdout).toContain('valid manifest');
   });
 
+  test('schema CLI exposes onboard-recommended gbrain-base-v2 pack', () => {
+    const listed = gbrain(['schema', 'list']);
+    expect(listed.code).toBe(0);
+    expect(listed.stdout).toContain('gbrain-base-v2');
+
+    const shown = gbrain(['schema', 'show', 'gbrain-base-v2']);
+    expect(shown.code).toBe(0);
+    expect(shown.stdout).toContain('gbrain-base-v2 v1.0.0');
+    expect(shown.stdout).toContain('Page types (15)');
+
+    const validated = gbrain(['schema', 'validate', 'gbrain-base-v2']);
+    expect(validated.code).toBe(0);
+    expect(validated.stdout).toContain('valid manifest');
+  });
+
   test('schema active reports default resolution', () => {
     const r = gbrain(['schema', 'active']);
     expect(r.code).toBe(0);
