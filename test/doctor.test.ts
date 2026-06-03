@@ -48,6 +48,28 @@ describe('doctor command', () => {
     expect(block).toContain('skippedNonTranscript');
   });
 
+  test('image_assets resolves relative storage paths against the owning source local_path', async () => {
+    const { mkdtempSync, mkdirSync, rmSync, writeFileSync } = await import('fs');
+    const { tmpdir } = await import('os');
+    const { join } = await import('path');
+    const { findExistingImageAssetPath, imageAssetCandidatePaths } = await import('../src/commands/doctor.ts');
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-doctor-image-assets-'));
+    try {
+      const storagePath = 'personal/equipment/hot-tub-maintenance/photo.jpg';
+      const imagePath = join(root, storagePath);
+      mkdirSync(join(root, 'personal/equipment/hot-tub-maintenance'), { recursive: true });
+      writeFileSync(imagePath, 'jpg');
+
+      const unrelatedCwd = join(root, 'not-the-vault-root');
+      mkdirSync(unrelatedCwd);
+
+      expect(imageAssetCandidatePaths(storagePath, root, unrelatedCwd)).toContain(imagePath);
+      expect(findExistingImageAssetPath(storagePath, root, unrelatedCwd)).toBe(imagePath);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('doctor module exports runDoctor', async () => {
     const { runDoctor } = await import('../src/commands/doctor.ts');
     expect(typeof runDoctor).toBe('function');

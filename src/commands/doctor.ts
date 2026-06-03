@@ -83,6 +83,29 @@ export interface Check {
   category?: CheckCategory;
 }
 
+export function imageAssetCandidatePaths(
+  storagePath: string,
+  sourceLocalPath?: string | null,
+  cwd = process.cwd(),
+): string[] {
+  if (isAbsolute(storagePath)) return [resolvePath(storagePath)];
+  const candidates = [resolvePath(cwd, storagePath)];
+  if (sourceLocalPath) candidates.push(resolvePath(sourceLocalPath, storagePath));
+  return Array.from(new Set(candidates));
+}
+
+export function findExistingImageAssetPath(
+  storagePath: string,
+  sourceLocalPath?: string | null,
+  cwd = process.cwd(),
+  exists: (path: string) => boolean = existsSync,
+): string | null {
+  for (const candidate of imageAssetCandidatePaths(storagePath, sourceLocalPath, cwd)) {
+    if (exists(candidate)) return candidate;
+  }
+  return null;
+}
+
 /**
  * Structured doctor report. Stable shape consumed by:
  *   - gbrain doctor --json (CLI)
@@ -6669,16 +6692,18 @@ export async function buildChecks(
   if (engine) {
     progress.heartbeat('image_assets');
     try {
-      const rows = await engine.executeRaw<{ storage_path: string }>(
-        `SELECT storage_path FROM files WHERE mime_type LIKE 'image/%' LIMIT 1000`
+      const rows = await engine.executeRaw<{ source_id: string | null; storage_path: string }>(
+        `SELECT source_id, storage_path FROM files WHERE mime_type LIKE 'image/%' LIMIT 1000`
       );
+      const sourceRows = await engine.executeRaw<{ id: string; local_path: string | null }>(
+        `SELECT id, local_path FROM sources`
+      );
+      const sourceLocalPaths = new Map(sourceRows.map((s) => [s.id, s.local_path]));
       let vanished = 0;
       const vanishedPaths: string[] = [];
-      const fs = await import('node:fs');
       for (const r of rows) {
-        try {
-          fs.statSync(r.storage_path);
-        } catch {
+        const sourceLocalPath = r.source_id ? sourceLocalPaths.get(r.source_id) : null;
+        if (!findExistingImageAssetPath(r.storage_path, sourceLocalPath)) {
           vanished++;
           if (vanishedPaths.length < 5) vanishedPaths.push(r.storage_path);
         }
