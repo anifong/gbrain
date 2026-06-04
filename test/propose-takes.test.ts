@@ -48,6 +48,10 @@ function buildMockEngine(opts: {
     async listPages() {
       return opts.pages;
     },
+    async putPage(slug: string, page: unknown, putOpts?: { sourceId?: string }) {
+      captured.push({ sql: 'putPage', params: [slug, page, putOpts] });
+      return { id: 999, slug, ...(page as object) } as Page;
+    },
     async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
       captured.push({ sql, params: params ?? [] });
       // SELECT idempotency check
@@ -80,7 +84,7 @@ function buildPage(opts: { slug: string; body: string; sourceId?: string }): Pag
   } as Page;
 }
 
-function buildCtx(engine: BrainEngine): OperationContext {
+function buildCtx(engine: BrainEngine, overrides: Partial<OperationContext> = {}): OperationContext {
   return {
     engine,
     config: {} as never,
@@ -88,6 +92,7 @@ function buildCtx(engine: BrainEngine): OperationContext {
     dryRun: false,
     remote: false,
     sourceId: 'default',
+    ...overrides,
   };
 }
 
@@ -243,6 +248,29 @@ describe('extractExistingTakesForDedup', () => {
 // ─── Phase integration ──────────────────────────────────────────────
 
 describe('runPhaseProposeTakes — phase integration', () => {
+  test('dryRun short-circuits before extractor calls or writes', async () => {
+    const pages = [buildPage({ slug: 'wiki/concepts/network-effects', body: 'Marketplaces with cold-start liquidity always win.' })];
+    const { engine, captured } = buildMockEngine({ pages });
+    let extractorCalled = false;
+    const extractor: ProposeTakesExtractor = async () => {
+      extractorCalled = true;
+      return [{ claim_text: 'should not run', kind: 'take', holder: 'brain', weight: 0.5 }];
+    };
+
+    const result = await runPhaseProposeTakes(buildCtx(engine, { dryRun: true }), { extractor, dryRun: true });
+
+    expect(result.status).toBe('ok');
+    expect(result.summary).toContain('dry-run: propose_takes would scan 1 page(s); no LLM calls or writes');
+    expect(extractorCalled).toBe(false);
+    expect(captured.filter(c => c.sql.includes('INSERT INTO take_proposals'))).toHaveLength(0);
+    expect(captured.filter(c => c.sql.includes('upsertExtractRollup'))).toHaveLength(0);
+    const details = result.details as Record<string, unknown>;
+    expect(details.dryRun).toBe(true);
+    expect(details.pages_scanned).toBe(1);
+    expect(details.cache_misses).toBe(0);
+    expect(details.proposals_inserted).toBe(0);
+  });
+
   test('happy path: scans pages, extracts proposals, writes via INSERT', async () => {
     const pages = [buildPage({ slug: 'wiki/concepts/network-effects', body: 'Marketplaces with cold-start liquidity always win.' })];
     const { engine, captured } = buildMockEngine({ pages });
