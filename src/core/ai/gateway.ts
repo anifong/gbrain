@@ -2241,12 +2241,27 @@ export interface ChatToolDef {
  * production subagent jobs) throws "messages do not match the ModelMessage[]
  * schema" the moment the model calls a tool. Surfaced by the SkillOpt eval.
  */
+function toJsonValue(value: unknown): unknown {
+  try {
+    const json = JSON.stringify(value, (_key, v) => (typeof v === 'bigint' ? v.toString() : v));
+    return json === undefined ? null : JSON.parse(json);
+  } catch {
+    return String(value);
+  }
+}
+
+function toolResultText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  const jsonValue = toJsonValue(value);
+  return typeof jsonValue === 'string' ? jsonValue : JSON.stringify(jsonValue);
+}
+
 export function toModelMessages(messages: ChatMessage[]): unknown[] {
   return messages.map((m) => {
     if (typeof m.content === 'string') return { role: m.role, content: m.content };
     const blocks = m.content;
     if (blocks.some((b) => b.type === 'tool-result')) {
-      // v6: tool results ride on a dedicated `tool` role with structured output.
+      // v6: tool results ride on a dedicated `tool` role with structured JSONValue output.
       return {
         role: 'tool' as const,
         content: blocks
@@ -2256,10 +2271,10 @@ export function toModelMessages(messages: ChatMessage[]): unknown[] {
             toolCallId: b.toolCallId,
             toolName: b.toolName,
             output: b.isError
-              ? { type: 'error-text' as const, value: typeof b.output === 'string' ? b.output : JSON.stringify(b.output) }
+              ? { type: 'error-text' as const, value: toolResultText(b.output) }
               : (typeof b.output === 'string'
                 ? { type: 'text' as const, value: b.output }
-                : { type: 'json' as const, value: (b.output ?? null) as never }),
+                : { type: 'json' as const, value: toJsonValue(b.output) as never }),
           })),
       };
     }
