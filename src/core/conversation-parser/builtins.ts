@@ -1,7 +1,7 @@
 /**
  * v0.41.16.0 — Built-in conversation parser pattern registry.
  *
- * Fourteen hand-vetted patterns covering the chat-export formats this
+ * Fifteen hand-vetted patterns covering the chat-export formats this
  * codebase is most likely to encounter. Each pattern's regex was
  * derived from a public format reference (source_doc field) so future
  * maintainers can verify against the wild shape.
@@ -50,7 +50,7 @@ export function cleanSpeaker(raw: string, override?: RegExp): string {
   return stripped || raw.trim();
 }
 
-/** The 14 hand-vetted built-in patterns. */
+/** The 15 hand-vetted built-in patterns. */
 export const BUILTIN_PATTERNS: readonly PatternEntry[] = [
   // -------------------------------------------------------------------
   // INLINE-DATE patterns (date in every line; less ambiguous; tried first).
@@ -117,6 +117,41 @@ export const BUILTIN_PATTERNS: readonly PatternEntry[] = [
       'just text',
     ],
     source_doc: 'PR #1461 (closed); preserved verbatim with Co-Authored-By',
+  },
+
+  {
+    id: 'fathom-blockquote-time',
+    origin: 'builtin',
+    // Fathom exports embedded in Obsidian callouts use blockquoted
+    // bold timestamp+speaker anchors:
+    //   > **[00:00:00] Tami Jones:** Missing?
+    // Seconds are elapsed-time detail; the parser stores minute-level
+    // timestamps using the page/frontmatter date, matching the existing
+    // time-only convention.
+    regex: /^>\s*\*\*\[(\d{1,2}):(\d{2})(?::\d{2})?\]\s+(.+?):\*\*\s*(.*)$/,
+    captures: {
+      hour_group: 1,
+      minute_group: 2,
+      speaker_group: 3,
+      text_group: 4,
+    },
+    date_source: 'frontmatter',
+    time_format: '24h',
+    timezone_policy: 'utc_assumed_with_warn',
+    multi_line: false,
+    quick_reject: /^>\s*\*\*\[/,
+    test_positive: [
+      '> **[00:00:00] Tami Jones:** Missing?',
+      '> **[00:01:06] Dereje Nigussie:** All right.',
+      '> **[12:34] Nicole Reints:** Minute-only variant still works.',
+    ],
+    test_negative: [
+      '**[18:37] \u{1f464} Alice:** telegram bracket without blockquote',
+      '> [!note]- Full Transcript',
+      '> **Alice:** bold-name callout, no timestamp',
+      '**Alice Example** (00:00): bold paren time',
+    ],
+    source_doc: 'Fathom transcript callout shape in Andy/Njevity meeting notes',
   },
 
   {

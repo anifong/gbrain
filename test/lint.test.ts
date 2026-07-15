@@ -1,5 +1,8 @@
 import { describe, test, expect } from 'bun:test';
-import { lintContent, fixContent } from '../src/commands/lint.ts';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { lintContent, fixContent, runLintCore } from '../src/commands/lint.ts';
 
 describe('lintContent', () => {
   test('detects LLM preamble "Of course"', () => {
@@ -30,6 +33,12 @@ describe('lintContent', () => {
     const content = '```markdown\n---\ntitle: Test\n---\n\n# Test\n\nContent.\n```';
     const issues = lintContent(content, 'test.md');
     expect(issues.some(i => i.rule === 'code-fence-wrap')).toBe(true);
+  });
+
+  test('does not flag internal markdown code fences', () => {
+    const content = '---\ntitle: Test\ntype: concept\ncreated: 2026-04-11\n---\n\n# Test\n\n```markdown\n# example\n```\n\nContent.';
+    const issues = lintContent(content, 'test.md');
+    expect(issues.some(i => i.rule === 'code-fence-wrap')).toBe(false);
   });
 
   test('detects placeholder dates', () => {
@@ -114,5 +123,34 @@ describe('fixContent', () => {
     expect(fixed).not.toContain('Sure');
     expect(fixed).not.toContain('Certainly');
     expect(fixed).toContain('# Title');
+  });
+
+  test('repairs frontmatter fixable issues', () => {
+    const input = '---\ntitle: "Phil "Nick" Last"\ntype: person\ncreated: 2026-04-11\n---\n\n# Phil\n';
+    const fixed = fixContent(input, 'people/phil.md');
+    expect(fixed).toContain(`title: 'Phil "Nick" Last'`);
+  });
+});
+
+describe('runLintCore', () => {
+  test('fixes frontmatter fixable issues and reports legacy unfixable separately', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-lint-'));
+    try {
+      const fixable = join(dir, 'fixable.md');
+      const legacy = join(dir, 'legacy.md');
+      writeFileSync(fixable, '---\ntitle: "Phil "Nick" Last"\ntype: person\ncreated: 2026-04-11\n---\n\n# Phil\n');
+      writeFileSync(legacy, '---\ntitle: Legacy\ncreated: 2026-04-11\n---\n\n# Legacy\n');
+
+      const result = await runLintCore({ target: dir, fix: true });
+      expect(result.total_fixable).toBe(1);
+      expect(result.total_fixed).toBe(1);
+      expect(readFileSync(fixable, 'utf8')).toContain(`title: 'Phil "Nick" Last'`);
+
+      const after = await runLintCore({ target: dir });
+      expect(after.total_fixable).toBe(0);
+      expect(after.total_issues).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

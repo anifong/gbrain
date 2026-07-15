@@ -557,6 +557,41 @@ describe('bold-name-no-time pattern (Circleback/Granola/Zoom, no timestamp)', ()
     expect(r.matched_pattern_id).toBe('telegram-bracket');
   });
 
+  test('REGRESSION: Fathom blockquote transcript with HH:MM:SS parses speaker lines', () => {
+    const preamble = [
+      '# Cloud Talk',
+      '**Date:** 2026-05-15 12:30',
+      '**Recorded by:** Tami Jones (Pit Crew)',
+      '**Fathom link:** https://fathom.video/share/example',
+      '## Summary',
+      'Meeting purpose and key takeaways live above the transcript.',
+      ...Array.from({ length: 60 }, (_, i) => `Summary prose line ${i}.`),
+      '## Transcript',
+      '> [!note]- Full Transcript',
+    ];
+    const transcript = Array.from({ length: 20 }, (_, i) => [
+      `> **[00:${String(i).padStart(2, '0')}:00] Speaker ${i}:** Transcript line ${i}.`,
+      '>',
+    ]).flat();
+    transcript[0] = '> **[00:00:00] Tami Jones:** Missing?';
+    transcript[4] = '> **[00:02:00] Chris Dobkins:** So let’s go ahead and start with headlines.';
+    const body = [...preamble, ...transcript].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-05-15' });
+    expect(r.phase).toBe('regex_match');
+    expect(r.matched_pattern_id).toBe('fathom-blockquote-time');
+    expect(r.messages).toHaveLength(20);
+    expect(r.messages[0]).toEqual({
+      speaker: 'Tami Jones',
+      timestamp: '2026-05-15T00:00:00Z',
+      text: 'Missing?',
+    });
+    expect(r.messages[2]).toEqual({
+      speaker: 'Chris Dobkins',
+      timestamp: '2026-05-15T00:02:00Z',
+      text: 'So let’s go ahead and start with headlines.',
+    });
+  });
+
   // F1 (Codex): the broad regex matches any `**Label:** text`. A prose notes
   // page with bold labels CLUSTERED in its first 10 lines scores 0.3 on the
   // head pass (3/10) — NOT < SCORING_HEAD_TRIGGER_THRESHOLD (0.3), so the

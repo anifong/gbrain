@@ -133,6 +133,12 @@ describe('parseMarkdown validation surface', () => {
       const parsed = parseMarkdown(md, undefined, { validate: true });
       expect(parsed.errors!.map(e => e.code)).not.toContain('NESTED_QUOTES');
     });
+
+    test('flow list with quoted wiki links does not trigger', () => {
+      const md = `${fence}\ntype: concept\ntitle: Link List\nrelated: ["[[Ella]]", "[[NanoClaw]]", "[[Andy Nifong]]"]\n${fence}\n\nbody`;
+      const parsed = parseMarkdown(md, undefined, { validate: true });
+      expect(parsed.errors!.map(e => e.code)).not.toContain('NESTED_QUOTES');
+    });
   });
 
   // The validator's count-of-quotes heuristic is too dumb: it flagged

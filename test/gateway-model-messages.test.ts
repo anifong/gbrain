@@ -11,6 +11,7 @@
  * v6 shapes that `generateText` accepts (verified against AI SDK 6.0.174).
  */
 import { describe, test, expect } from 'bun:test';
+import { modelMessageSchema } from 'ai';
 import { toModelMessages, type ChatMessage } from '../src/core/ai/gateway.ts';
 
 describe('toModelMessages — v6 ModelMessage shape', () => {
@@ -119,5 +120,44 @@ describe('toModelMessages — v6 ModelMessage shape', () => {
     expect((out[1] as any).role).toBe('assistant');
     expect((out[2] as any).role).toBe('tool');
     expect((out[2] as any).content[0].output).toEqual({ type: 'json', value: { hits: 0 } });
+  });
+
+  test('live tool outputs are serialized to AI SDK JSONValue-compatible tool-result parts', () => {
+    const converted = toModelMessages([
+      { role: 'user', content: 'summarize salience' },
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool-call',
+          toolCallId: 'call_1',
+          toolName: 'brain_get_recent_salience',
+          input: { days: 1, limit: 1 },
+        }],
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'call_1',
+          toolName: 'brain_get_recent_salience',
+          output: {
+            slug: 'personal/life/projects/example',
+            updated_at: new Date('2026-06-03T20:42:17.598Z'),
+            count: BigInt(7),
+          },
+        }],
+      },
+    ] as any);
+
+    const parsed = modelMessageSchema.array().safeParse(converted);
+    expect(parsed.success).toBe(true);
+    expect((converted[2] as any).content[0].output).toEqual({
+      type: 'json',
+      value: {
+        slug: 'personal/life/projects/example',
+        updated_at: '2026-06-03T20:42:17.598Z',
+        count: '7',
+      },
+    });
   });
 });

@@ -87,6 +87,29 @@ export interface Check {
   category?: CheckCategory;
 }
 
+export function imageAssetCandidatePaths(
+  storagePath: string,
+  sourceLocalPath?: string | null,
+  cwd = process.cwd(),
+): string[] {
+  if (isAbsolute(storagePath)) return [resolvePath(storagePath)];
+  const candidates = [resolvePath(cwd, storagePath)];
+  if (sourceLocalPath) candidates.push(resolvePath(sourceLocalPath, storagePath));
+  return Array.from(new Set(candidates));
+}
+
+export function findExistingImageAssetPath(
+  storagePath: string,
+  sourceLocalPath?: string | null,
+  cwd = process.cwd(),
+  exists: (path: string) => boolean = existsSync,
+): string | null {
+  for (const candidate of imageAssetCandidatePaths(storagePath, sourceLocalPath, cwd)) {
+    if (exists(candidate)) return candidate;
+  }
+  return null;
+}
+
 /**
  * Structured doctor report. Stable shape consumed by:
  *   - gbrain doctor --json (CLI)
@@ -140,6 +163,51 @@ export interface DoctorReport {
   top_issues?: RankedIssue[];
 }
 
+/**
+ * Doctor's conversation-format coverage check should measure transcript-like
+ * pages, not every page whose schema type happens to be `meeting`. Obsidian
+ * vaults often store prose meeting notes and generated index pages under that
+ * type; counting those as parser failures makes the coverage warning noisy.
+ *
+ * Keep this predicate intentionally conservative: explicit transcript headers
+ * are candidates, as are bodies with multiple timestamped chat-line anchors.
+ * Plain bold metadata (`**Date:**`, `**Attendees:**`, `**Goal:**`) is not.
+ */
+export function isPotentialConversationTranscriptBody(
+  page: { slug?: string | null },
+  body: string,
+): boolean {
+  const slug = (page.slug ?? '').toLowerCase();
+  if (/\/(orphan-index|index)$/.test(slug)) return false;
+
+  const lines = body
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return false;
+
+  if (
+    lines.some(
+      (line) =>
+        /^(?:>\s*)?(?:#{1,6}\s+)?(?:full\s+)?transcript\b/i.test(line) ||
+        /^(?:>\s*)?\[![^\]]+\]-?\s*(?:full\s+)?transcript\b/i.test(line),
+    )
+  ) {
+    return true;
+  }
+
+  const timestampedAnchorCount = lines.filter(
+    (line) =>
+      /^>\s*\*\*\[\d{1,2}:\d{2}(?::\d{2})?\]\s+[^:]{1,160}:\*\*/.test(line) ||
+      /^\[\d{1,2}:\d{2}(?::\d{2})?\]\s+\S+/.test(line) ||
+      /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(line) ||
+      /^\d{1,2}\/\d{1,2}\/\d{2,4},?\s+\d{1,2}:\d{2}\s*(?:AM|PM)?\s+-\s+[^:]{1,160}:/.test(line) ||
+      /^\*\*[^*\n]{1,160}\*\*\s+\(\d{1,2}:\d{2}(?::\d{2})?\):/.test(line),
+  ).length;
+
+  return timestampedAnchorCount >= 2;
+}
+
 function _penaltyScore(checks: Check[]): number {
   let score = 100;
   for (const c of checks) {
@@ -163,6 +231,36 @@ function _penaltyScore(checks: Check[]): number {
  * categorizer is the single source of truth in
  * `src/core/doctor-categories.ts`.
  */
+export function hnswIndexStatusForEmbeddingColumn(input: {
+  engineKind: string;
+  column: string;
+  type: string;
+  dimensions: number;
+  hasIndex: boolean;
+  quoteIdentifier?: (name: string) => string;
+}): { status: 'ok' | 'warn'; message?: string } {
+  if (input.engineKind !== 'postgres' || input.hasIndex) return { status: 'ok' };
+
+  // pgvector HNSW supports up to 2000 dimensions for vector and 4000 for
+  // halfvec. Above that, exact scan is expected; recommending CREATE INDEX is
+  // an impossible fix for 2560-dim providers such as ZeroEntropy zembed-1.
+  const hnswLimit = input.type === 'halfvec' ? 4000 : 2000;
+  if (input.dimensions > hnswLimit) {
+    return {
+      status: 'ok',
+      message: `${input.column}: HNSW unsupported for ${input.dimensions} dimensions (${input.type} limit ${hnswLimit}); exact scan is expected.`,
+    };
+  }
+
+  const quote = input.quoteIdentifier ?? ((name: string) => `"${name.replaceAll('"', '""')}"`);
+  return {
+    status: 'warn',
+    message:
+      `${input.column}: no HNSW index. Search works but uses sequential scan. ` +
+      `Fix: CREATE INDEX IF NOT EXISTS idx_chunks_${input.column} ON content_chunks USING hnsw (${quote(input.column)} ${input.type}_cosine_ops);`,
+  };
+}
+
 export function computeDoctorReport(checks: Check[]): DoctorReport {
   const tagged = checks.map((c) =>
     c.category ? c : { ...c, category: categorizeCheck(c.name) },
@@ -4879,34 +4977,51 @@ export async function buildChecks(
       } else {
         const hitsByPattern: Record<string, number> = {};
         let unmatched = 0;
+        let included = 0;
+        let skippedNonTranscript = 0;
         for (const page of sample) {
           const body = `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`.trim();
           const result = parseConversation(body, { page, noPolish: true, noFallback: true });
+          if (result.phase === 'no_match' && !isPotentialConversationTranscriptBody(page, body)) {
+            skippedNonTranscript++;
+            continue;
+          }
+          included++;
           const id = result.matched_pattern_id ?? '_no_match';
           hitsByPattern[id] = (hitsByPattern[id] ?? 0) + 1;
           if (result.phase === 'no_match') unmatched++;
         }
-        const unmatchedPct = (unmatched / sample.length) * 100;
-        const breakdown = Object.entries(hitsByPattern)
-          .sort(([, a], [, b]) => b - a)
-          .map(([k, v]) => `${k}=${v}`)
-          .join(', ');
-        if (unmatchedPct > 10) {
-          checks.push({
-            name: 'conversation_format_coverage',
-            status: 'warn',
-            message:
-              `${unmatched}/${sample.length} conversation pages (${unmatchedPct.toFixed(1)}%) match NO built-in pattern. ` +
-              `Breakdown: ${breakdown}. ` +
-              `Investigate: gbrain conversation-parser scan <slug> | ` +
-              `Enable LLM fallback (opt-in): gbrain config set conversation_parser.llm_fallback_enabled true`,
-          });
-        } else {
+        if (included === 0) {
           checks.push({
             name: 'conversation_format_coverage',
             status: 'ok',
-            message: `${sample.length} pages: ${breakdown}`,
+            message:
+              `No transcript-shaped conversation pages — skipped ${skippedNonTranscript} note/index pages`,
           });
+        } else {
+          const unmatchedPct = (unmatched / included) * 100;
+          const breakdown = Object.entries(hitsByPattern)
+            .sort(([, a], [, b]) => b - a)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(', ');
+          const skippedSuffix = skippedNonTranscript > 0 ? ` Skipped ${skippedNonTranscript} note/index pages.` : '';
+          if (unmatchedPct > 10) {
+            checks.push({
+              name: 'conversation_format_coverage',
+              status: 'warn',
+              message:
+                `${unmatched}/${included} transcript-shaped conversation pages (${unmatchedPct.toFixed(1)}%) match NO built-in pattern. ` +
+                `Breakdown: ${breakdown}.${skippedSuffix} ` +
+                `Investigate: gbrain conversation-parser scan <slug> | ` +
+                `Enable LLM fallback (opt-in): gbrain config set conversation_parser.llm_fallback_enabled true`,
+            });
+          } else {
+            checks.push({
+              name: 'conversation_format_coverage',
+              status: 'ok',
+              message: `${included} transcript-shaped pages: ${breakdown}.${skippedSuffix}`,
+            });
+          }
         }
       }
     } catch (err) {
@@ -5692,12 +5807,23 @@ export async function buildChecks(
           );
           continue;
         }
-        if (engine.kind === 'postgres' && haveIndex.get(colName) === false) {
-          issues.push(
-            `${colName}: no HNSW index. Search works but uses sequential scan. ` +
-              `Fix: CREATE INDEX IF NOT EXISTS idx_chunks_${colName} ON content_chunks USING hnsw (${quoteIdentifier(colName)} ${entry.type}_cosine_ops);`,
-          );
-          continue;
+        if (engine.kind === 'postgres') {
+          const indexStatus = hnswIndexStatusForEmbeddingColumn({
+            engineKind: engine.kind,
+            column: colName,
+            type: entry.type,
+            dimensions: entry.dimensions,
+            hasIndex: haveIndex.get(colName) === true,
+            quoteIdentifier,
+          });
+          if (indexStatus.status === 'warn' && indexStatus.message) {
+            issues.push(indexStatus.message);
+            continue;
+          }
+          if (indexStatus.message) {
+            okColumns.push(`${colName} (${indexStatus.message})`);
+            continue;
+          }
         }
         okColumns.push(colName);
       }
@@ -7153,16 +7279,18 @@ export async function buildChecks(
   if (engine) {
     progress.heartbeat('image_assets');
     try {
-      const rows = await engine.executeRaw<{ storage_path: string }>(
-        `SELECT storage_path FROM files WHERE mime_type LIKE 'image/%' LIMIT 1000`
+      const rows = await engine.executeRaw<{ source_id: string | null; storage_path: string }>(
+        `SELECT source_id, storage_path FROM files WHERE mime_type LIKE 'image/%' LIMIT 1000`
       );
+      const sourceRows = await engine.executeRaw<{ id: string; local_path: string | null }>(
+        `SELECT id, local_path FROM sources`
+      );
+      const sourceLocalPaths = new Map(sourceRows.map((s) => [s.id, s.local_path]));
       let vanished = 0;
       const vanishedPaths: string[] = [];
-      const fs = await import('node:fs');
       for (const r of rows) {
-        try {
-          fs.statSync(r.storage_path);
-        } catch {
+        const sourceLocalPath = r.source_id ? sourceLocalPaths.get(r.source_id) : null;
+        if (!findExistingImageAssetPath(r.storage_path, sourceLocalPath)) {
           vanished++;
           if (vanishedPaths.length < 5) vanishedPaths.push(r.storage_path);
         }
