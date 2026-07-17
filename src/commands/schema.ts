@@ -23,6 +23,7 @@ import {
   addAliasToType,
   addLinkTypeToPack,
   addPrefixToType,
+  BUNDLED_PACK_NAMES,
   addTypeToPack,
   invalidatePackCache,
   loadActivePack,
@@ -179,7 +180,7 @@ async function runActive(_args: string[]): Promise<void> {
 }
 
 function runList(_args: string[]): void {
-  const bundled = listBundledPackNames();
+  const bundled = [...BUNDLED_PACK_NAMES];
   const installedDir = gbrainPath('schema-packs');
   const installed: string[] = [];
   if (existsSync(installedDir)) {
@@ -365,33 +366,16 @@ function runUse(args: string[]): void {
   console.log(`\nRun \`gbrain schema active\` to verify resolution.`);
 }
 
-function bundledPackBaseDirs(): string[] {
-  const here = dirname(new URL(import.meta.url).pathname);
-  return [
-    join(here, '..', 'core', 'schema-pack', 'base'),
-    join(here, '..', '..', 'src', 'core', 'schema-pack', 'base'),
-  ];
-}
-
-function listBundledPackNames(): string[] {
-  const names = new Set<string>();
-  for (const dir of bundledPackBaseDirs()) {
-    if (!existsSync(dir)) continue;
-    for (const entry of readdirSync(dir)) {
-      if (entry.endsWith('.yaml')) names.add(entry.slice(0, -'.yaml'.length));
-      if (entry.endsWith('.yml')) names.add(entry.slice(0, -'.yml'.length));
-    }
-  }
-  return [...names].sort();
-}
-
 function packPathByName(name: string): string | null {
-  if (/^[a-z0-9-]+$/.test(name)) {
-    for (const dir of bundledPackBaseDirs()) {
-      for (const ext of ['yaml', 'yml', 'json']) {
-        const candidate = join(dir, `${name}.${ext}`);
-        if (existsSync(candidate)) return candidate;
-      }
+  if (BUNDLED_PACK_NAMES.has(name)) {
+    // Resolve bundled YAML — try a few locations.
+    const here = dirname(new URL(import.meta.url).pathname);
+    const candidates = [
+      join(here, '..', 'core', 'schema-pack', 'base', `${name}.yaml`),
+      join(here, '..', '..', 'src', 'core', 'schema-pack', 'base', `${name}.yaml`),
+    ];
+    for (const c of candidates) {
+      if (existsSync(c)) return c;
     }
   }
   const baseDir = gbrainPath('schema-packs', name);
