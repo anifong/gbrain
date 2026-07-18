@@ -959,6 +959,12 @@ async function runPhaseExtract(
   dryRun: boolean,
   changedSlugs?: string[],
   signal?: AbortSignal,
+  // #1503: the brain source the cycle is scoped to (cycleSourceId — explicit
+  // --source or resolved from brainDir). Threaded to runExtractCore so
+  // fs-walk link/timeline rows carry source_id; without it addLinksBatch maps
+  // missing → 'default' and its pages JOIN drops every row on a federated
+  // brain ("Links: created 0 from N pages" every cycle).
+  sourceId?: string,
 ): Promise<PhaseResult> {
   try {
     const { runExtractCore } = await import('../commands/extract.ts');
@@ -981,6 +987,7 @@ async function runPhaseExtract(
       dir: brainDir,
       slugs: changedSlugs,  // undefined = full walk (first run / manual)
       signal,
+      sourceId,
     });
     const linksCreated = result?.links_created ?? 0;
     const timelineCreated = result?.timeline_entries_created ?? 0;
@@ -1678,6 +1685,9 @@ export async function runCycle(
           from: opts.synthFrom,
           to: opts.synthTo,
           bypassDreamGuard: opts.synthBypassDreamGuard,
+          // #1586: scope synthesized writes to the cycle's resolved source
+          // (explicit --source wins, else derived from the checkout dir).
+          sourceId: cycleSourceId,
         }));
         result.duration_ms = duration_ms;
         phaseResults.push(result);
@@ -1709,7 +1719,7 @@ export async function runCycle(
         // If sync didn't run (phases exclude it) or failed, syncPagesAffected
         // is undefined → extract falls back to full walk (safe default).
         progress.start('cycle.extract');
-        const { result, duration_ms } = await timePhase(() => runPhaseExtract(engine, brainDir, dryRun, syncPagesAffected, opts.signal));
+        const { result, duration_ms } = await timePhase(() => runPhaseExtract(engine, brainDir, dryRun, syncPagesAffected, opts.signal, cycleSourceId));
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();
