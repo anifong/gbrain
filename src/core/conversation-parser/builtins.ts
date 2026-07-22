@@ -214,6 +214,41 @@ export const BUILTIN_PATTERNS: readonly PatternEntry[] = [
   },
 
   {
+    // iMessage sync's time-only 12-hour shape. AM/PM is required so this
+    // cannot shadow bold-paren-time's 24-hour form or imessage-slack's
+    // full-date form.
+    id: 'bold-paren-time-12h',
+    origin: 'builtin',
+    regex: /^\*\*(.+?)\*\*\s*\((\d{1,2}):(\d{2})\s*(AM|PM|am|pm)\)\s*:\s*(.*)$/,
+    captures: {
+      speaker_group: 1,
+      hour_group: 2,
+      minute_group: 3,
+      ampm_group: 4,
+      text_group: 5,
+    },
+    date_source: 'frontmatter',
+    time_format: '12h_ampm',
+    timezone_policy: 'utc_assumed_with_warn',
+    multi_line: false,
+    quick_reject: /^\*\*/,
+    test_positive: [
+      '**Me** (9:04 AM): sounds good, see you then',
+      '**+155****0135** (9:39 AM): Will do',
+      '**Alice Example** (12:00 PM): noon message',
+      '**Bob Example** (5:38 pm): lowercase ampm',
+    ],
+    test_negative: [
+      '**Alice** (00:00): 24h shape',
+      '**Alice Example** (2024-03-15 9:00 AM): full-date iMessage shape',
+      '**[18:37] G T:** telegram bracket',
+      'Alice (9:00 AM): missing the bold',
+    ],
+    source_doc:
+      'Time-only 12h AM/PM iMessage export shape: `**Speaker** (H:MM AM): text`',
+  },
+
+  {
     // Fathom/phone-call raw transcripts in this workspace use a plain
     // `Speaker A: ...` / `Speaker B: ...` shape with no per-line time.
     // Narrow on the literal `Speaker ` prefix so we don't accidentally

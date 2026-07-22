@@ -77,7 +77,7 @@ describe('runConversationParser — help', () => {
 });
 
 describe('runConversationParser — list-builtins', () => {
-  test('human output includes every pattern id', async () => {
+  test('human output includes all built-in pattern ids', async () => {
     const cap = captureStdio();
     try {
       await runConversationParser(null, ['list-builtins']);

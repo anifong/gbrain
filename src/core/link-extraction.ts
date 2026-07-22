@@ -489,7 +489,17 @@ export async function extractPageLinks(
       // text inside `[[...]]` before any `|`), NOT the display alias
       // (ref.name = match[2]). `[[struktura|the project]]` must resolve
       // `struktura`, not "the project". The display text is for context only.
-      const matches = await resolver.resolveBasenameMatches(ref.slug);
+      // Combine: upstream's path-qualified wikilink resolution
+      // (`[[notes/struktura]]` resolves by final segment, not a raw
+      // slash-containing literal) WITH HEAD's safe-target filter (drop
+      // self-references and unsafe basename targets). Downstream code
+      // consumes safeMatches[0], so we must produce it here.
+      const slashIdx = ref.slug.lastIndexOf('/');
+      const basename = slashIdx === -1 ? ref.slug : ref.slug.slice(slashIdx + 1);
+      let matches = await resolver.resolveBasenameMatches(basename);
+      if (slashIdx !== -1) {
+        matches = matches.filter(m => m === ref.slug || m.endsWith(`/${ref.slug}`));
+      }
       const safeMatches = matches.filter(matched =>
         matched !== slug && !isUnsafeBasenameResolutionTarget(matched),
       );
