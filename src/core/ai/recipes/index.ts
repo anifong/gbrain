@@ -18,6 +18,7 @@ import { groq } from './groq.ts';
 import { together } from './together.ts';
 import { llamaServer } from './llama-server.ts';
 import { minimax } from './minimax.ts';
+import { nous } from './nous.ts';
 import { dashscope } from './dashscope.ts';
 import { zhipu } from './zhipu.ts';
 import { azureOpenAI } from './azure-openai.ts';
@@ -39,6 +40,7 @@ const ALL: Recipe[] = [
   llamaServer,
   llamaServerReranker,
   minimax,
+  nous,
   dashscope,
   zhipu,
   azureOpenAI,
