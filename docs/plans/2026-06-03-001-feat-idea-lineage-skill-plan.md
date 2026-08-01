@@ -1,4 +1,5 @@
 ---
+created: 2026-07-18
 title: "feat: Add idea-lineage thinking skill"
 type: feat
 status: completed

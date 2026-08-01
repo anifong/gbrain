@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: reference-pack
 description: Reference skill demonstrating the 10/10 skillpack contract. Adds a "what does this skillpack do" answer to the user's agent.
 mutating: false

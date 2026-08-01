@@ -1,4 +1,5 @@
 ---
+created: 2026-07-18
 type: company
 title: NovaMind
 tags:

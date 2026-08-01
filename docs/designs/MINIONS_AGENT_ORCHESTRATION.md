@@ -1,4 +1,7 @@
 ---
+title: MINIONS AGENT ORCHESTRATION
+type: note
+created: 2026-07-18
 status: ACTIVE
 ---
 # CEO Plan: Minions as Universal Agent Orchestration Protocol

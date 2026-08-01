@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: multi-pattern
 description: Skill that uses multiple external tools without compliance
 triggers:

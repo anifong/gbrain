@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: compliant-position
 description: Skill that runs gbrain search before external lookup
 triggers:

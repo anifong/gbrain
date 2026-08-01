@@ -1,4 +1,5 @@
 ---
+created: 2026-07-18
 title: bob-example
 type: people
 slug: people/bob-example

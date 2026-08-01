@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: setup
 description: Set up GBrain with auto-provision Supabase or PGLite, AGENTS.md injection, first import
 triggers:

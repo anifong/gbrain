@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: ingest
 description: Route content to specialized ingestion skills. Detects input type and delegates.
 triggers:

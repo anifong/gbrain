@@ -1,4 +1,6 @@
 ---
+title: Search Modes
+created: 2026-07-18
 name: search-modes
 description: Three named search modes (conservative / balanced / tokenmax). Pick one at install; everything else inherits.
 type: convention

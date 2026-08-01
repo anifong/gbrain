@@ -1,4 +1,6 @@
 ---
+title: Alice Example
+created: 2026-07-18
 type: person
 name: Alice Example
 ---

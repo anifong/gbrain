@@ -1,4 +1,5 @@
 ---
+created: 2026-07-18
 title: 2025 Q3 portfolio decisions
 type: decisions
 date: 2025-09-30

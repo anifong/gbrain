@@ -1,4 +1,7 @@
 ---
+title: Ngrok Tunnel
+type: note
+created: 2026-07-18
 id: ngrok-tunnel
 name: Public Tunnel
 version: 0.7.0

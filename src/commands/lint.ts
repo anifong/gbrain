@@ -17,7 +17,8 @@
  */
 
 import { readFileSync, writeFileSync, readdirSync, statSync, lstatSync, existsSync } from 'fs';
-import { join, relative } from 'path';
+import { execFileSync } from 'child_process';
+import { join, relative, dirname } from 'path';
 import { isAborted } from '../core/abort-check.ts';
 import { parseMarkdown, type ParseValidationCode } from '../core/markdown.ts';
 import { autoFixFrontmatter } from '../core/brain-writer.ts';
@@ -29,6 +30,114 @@ import {
 import { loadOperatorLiterals } from '../core/content-sanity-literals.ts';
 import { loadConfig, loadConfigWithEngine, gbrainPath } from '../core/config.ts';
 import type { BrainEngine } from '../core/engine.ts';
+import { pruneDir } from '../core/sync.ts';
+
+/**
+ * Load `.gbrainignore` patterns from the given directory.
+ *
+ * Returns an array of glob-like patterns. Patterns are matched against
+ * directory-relative paths (forward-slash separated). Trailing-slash patterns
+ * match any file under that directory. Plain patterns match both files and
+ * directories. Negation (`!`) is supported.
+ *
+ * v0.42.x: allows repos to exclude project scaffolding from lint that is
+ * not `.gitignore`-able because the files are tracked (docs, test fixtures,
+ * examples, etc.).
+ */
+function loadGbrainIgnore(dir: string): string[] {
+  const ignorePath = join(dir, '.gbrainignore');
+  try {
+    const raw = readFileSync(ignorePath, 'utf8');
+    return raw.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Load rule-specific suppression patterns from `.gbrainignore`.
+ *
+ * Lines in `.gbrainignore` with the format `rule:<rule-name>: <pattern>`
+ * are parsed into a map of rule name → array of path/glob patterns.
+ * These are passed to `lintContent` via `LintContentOpts.suppressedRules`
+ * so that specific rules can be suppressed for specific files — e.g.
+ * `placeholder-date` in skill docs that document file naming conventions.
+ */
+function loadSuppressedRules(dir: string): Record<string, string[]> {
+  const ignorePath = join(dir, '.gbrainignore');
+  try {
+    const raw = readFileSync(ignorePath, 'utf8');
+    const result: Record<string, string[]> = {};
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const match = trimmed.match(/^rule:([\w-]+):\s*(.+)$/);
+      if (match) {
+        const [, ruleName, pattern] = match;
+        if (!result[ruleName]) result[ruleName] = [];
+        result[ruleName].push(pattern);
+      }
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Check if a directory-relative path matches any `.gbrainignore` pattern.
+ *
+ * Supports:
+ * - `dir/` (trailing slash) — matches any path starting with `dir/`
+ * - `dir` (no trailing slash) — matches directory `dir` or file `dir`
+ * - `*` wildcard in the final segment only
+ * - `!` negation (last match wins)
+ */
+function isIgnored(relPath: string, patterns: string[]): boolean {
+  if (!patterns.length) return false;
+  let ignored = false;
+  for (const pattern of patterns) {
+    const negate = pattern.startsWith('!');
+    const clean = negate ? pattern.slice(1) : pattern;
+
+    if (clean.endsWith('/')) {
+      // Directory prefix: matches anything under this dir
+      const dirPrefix = clean.slice(0, -1);
+      if (relPath.startsWith(dirPrefix + '/') || relPath === dirPrefix) {
+        ignored = !negate;
+      }
+    } else if (clean.includes('*')) {
+      // Simple glob: only in the final segment
+      const segIdx = clean.lastIndexOf('/');
+      if (segIdx === -1) {
+        // Pattern has no slash — match against the last segment only
+        const lastSeg = relPath.split('/').pop() || '';
+        const regex = globToRegex(clean);
+        if (regex.test(lastSeg)) {
+          ignored = !negate;
+        }
+      } else {
+        // Pattern with slash — match entire relPath
+        const regex = globToRegex(clean);
+        if (regex.test(relPath)) {
+          ignored = !negate;
+        }
+      }
+    } else {
+      // Plain string: match as directory prefix or exact file
+      if (relPath.startsWith(clean + '/') || relPath === clean) {
+        ignored = !negate;
+      }
+    }
+  }
+  return ignored;
+}
+
+/** Convert a simple glob (single * wildcard) to a RegExp. */
+function globToRegex(glob: string): RegExp {
+  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*');
+  return new RegExp('^' + escaped + '$');
+}
 
 export interface LintIssue {
   file: string;
@@ -90,11 +199,29 @@ export interface LintContentOpts {
     prose_check_enabled?: boolean;
     operator_literals?: ReadonlyArray<OperatorLiteral>;
   };
+  /** Rule-specific suppression map: rule name → array of `.gbrainignore`-style
+   *  path/glob patterns. When `filePath` matches any pattern for a rule, that
+   *  rule is suppressed for that file. Loaded from `.gbrainignore` lines
+   *  prefixed with `rule:<name>: <pattern>`. */
+  suppressedRules?: Record<string, string[]>;
 }
 
 export function lintContent(content: string, filePath: string, opts: LintContentOpts = {}): LintIssue[] {
   const issues: LintIssue[] = [];
   const lines = content.split('\n');
+  const suppressedRules = opts.suppressedRules ?? {};
+
+  /** Check if a rule is suppressed for this file path. */
+  function isRuleSuppressed(rule: string): boolean {
+    const patterns = suppressedRules[rule];
+    if (!patterns || patterns.length === 0) return false;
+    return patterns.some((p) => {
+      const clean = p.endsWith('/') ? p.slice(0, -1) : p;
+      if (clean.includes('*')) return globToRegex(clean).test(filePath);
+      // Plain string: match exact file or directory prefix
+      return filePath === clean || filePath.startsWith(clean + '/');
+    });
+  }
 
   // ── Frontmatter validation (delegates to parseMarkdown(validate:true)) ──
   // This is the single source of truth for frontmatter shape rules. Each
@@ -139,13 +266,15 @@ export function lintContent(content: string, filePath: string, opts: LintContent
   }
 
   // Rule: Placeholder dates
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].match(/\bYYYY-MM-DD\b/) || lines[i].match(/\bXX-XX\b/) || lines[i].match(/\b\d{4}-XX-XX\b/)) {
-      issues.push({
-        file: filePath, line: i + 1, rule: 'placeholder-date',
-        message: `Placeholder date found: ${lines[i].trim().slice(0, 60)}`,
-        fixable: false,
-      });
+  if (!isRuleSuppressed('placeholder-date')) {
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].match(/\bYYYY-MM-DD\b/) || lines[i].match(/\bXX-XX\b/) || lines[i].match(/\b\d{4}-XX-XX\b/)) {
+        issues.push({
+          file: filePath, line: i + 1, rule: 'placeholder-date',
+          message: `Placeholder date found: ${lines[i].trim().slice(0, 60)}`,
+          fixable: false,
+        });
+      }
     }
   }
 
@@ -176,7 +305,7 @@ export function lintContent(content: string, filePath: string, opts: LintContent
         });
       }
     }
-  } else {
+  } else if (!isRuleSuppressed('no-frontmatter')) {
     // No frontmatter at all
     issues.push({
       file: filePath, line: 1, rule: 'no-frontmatter',
@@ -199,6 +328,7 @@ export function lintContent(content: string, filePath: string, opts: LintContent
   }
 
   // Rule: Empty/stub sections
+  if (!isRuleSuppressed('empty-section')) {
   const sectionPattern = /^##\s+(.+)$/gm;
   let sectionMatch;
   while ((sectionMatch = sectionPattern.exec(content)) !== null) {
@@ -214,6 +344,7 @@ export function lintContent(content: string, filePath: string, opts: LintContent
         fixable: false,
       });
     }
+  }
   }
 
   // v0.41 content-sanity rules. Two new lint rules (huge-page +
@@ -246,7 +377,7 @@ export function lintContent(content: string, filePath: string, opts: LintContent
     // Rule: huge-page fires for both oversize_warn (over warn threshold)
     // AND oversize_block (over block threshold). Operator sees the same
     // rule name in both cases; the message names the actual byte count.
-    if (sanity.reasons.includes('oversize_warn') || sanity.reasons.includes('oversize_block')) {
+    if (!isRuleSuppressed('huge-page') && (sanity.reasons.includes('oversize_warn') || sanity.reasons.includes('oversize_block'))) {
       const threshold = sanity.reasons.includes('oversize_block') ? 'block' : 'warn';
       issues.push({
         file: filePath, line: 1, rule: 'huge-page',
@@ -396,19 +527,79 @@ async function resolveLintContentSanity(
   };
 }
 
-/** Collect markdown files from a directory */
+/**
+ * Collect markdown files from a directory, respecting `.gitignore` and
+ * `.gbrainignore`.
+ *
+ * Uses `git ls-files --cached --others --exclude-standard` when `dir` is a
+ * git work tree, so vendored/generated trees (node_modules, vendor, dist,
+ * build, venv, etc.) are never scanned. Falls back to a recursive FS walk
+ * with `pruneDir` exclusion when git isn't available.
+ *
+ * `.gbrainignore` (loaded from `dir/.gbrainignore`) applies additional
+ * directory-relative glob patterns to exclude project scaffolding that is
+ * tracked but not brain content (docs/, test/, examples/, etc.).
+ *
+ * Unlike `collectSyncableFiles`, this does NOT skip metafiles
+ * (README.md, index.md, schema.md, etc.) — lint intentionally checks them.
+ */
 function collectPages(dir: string): string[] {
+  const gitFiles = gitListMarkdownFiles(dir);
+  if (gitFiles) return gitFiles;
+
+  // FS-walk fallback: honors PRUNE_DIR_NAMES (node_modules, vendor, etc.)
+  // and dot-prefix dirs, but does NOT skip metafiles — lint covers them.
+  const ignorePatterns = loadGbrainIgnore(dir);
   const pages: string[] = [];
   function walk(d: string) {
     for (const entry of readdirSync(d)) {
-      if (entry.startsWith('.') || entry.startsWith('_')) continue;
+      if (!pruneDir(entry, d)) continue;
       const full = join(d, entry);
       if (lstatSync(full).isDirectory()) walk(full);
-      else if (entry.endsWith('.md')) pages.push(full);
+      else if (entry.endsWith('.md')) {
+        const relPath = relative(dir, full);
+        if (!isIgnored(relPath, ignorePatterns)) {
+          pages.push(full);
+        }
+      }
     }
   }
   walk(dir);
   return pages.sort();
+}
+
+/**
+ * Git-aware enumeration of `.md` files. Returns `null` when `dir` is not
+ * inside a git work tree or git is unavailable, so the caller can fall
+ * back to the FS walk. Honors `.gitignore` via `git ls-files` and
+ * `.gbrainignore` for additional directory-relative exclusions.
+ */
+function gitListMarkdownFiles(dir: string): string[] | null {
+  let stdout: string;
+  try {
+    stdout = execFileSync(
+      'git',
+      ['-C', dir, 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+      { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+  } catch {
+    return null;
+  }
+  const ignorePatterns = loadGbrainIgnore(dir);
+  const files: string[] = [];
+  for (const rel of stdout.split('\0')) {
+    if (!rel || !rel.endsWith('.md')) continue;
+    if (!rel.split('/').every((seg) => pruneDir(seg))) continue;
+    if (isIgnored(rel, ignorePatterns)) continue;
+    const full = join(dir, rel);
+    try {
+      if (lstatSync(full).isSymbolicLink() || !statSync(full).isFile()) continue;
+    } catch {
+      continue;
+    }
+    files.push(full);
+  }
+  return files.sort();
 }
 
 export interface LintOpts {
@@ -432,6 +623,10 @@ export interface LintOpts {
    * yields + checks this every 200 pages.
    */
   signal?: AbortSignal;
+  /** Rule-specific suppression map (rule name → glob patterns), loaded
+   *  from `.gbrainignore` `rule:<name>: <pattern>` lines. When omitted,
+   *  `runLintCore` loads it from the target directory's `.gbrainignore`. */
+  suppressedRules?: Record<string, string[]>;
 }
 
 export interface LintResult {
@@ -462,15 +657,16 @@ export async function runLintCore(opts: LintOpts): Promise<LintResult> {
   if (!existsSync(opts.target)) {
     throw new Error(`Not found: ${opts.target}`);
   }
-
   const isSingleFile = statSync(opts.target).isFile();
   const pages = isSingleFile ? [opts.target] : collectPages(opts.target);
+  const dir = isSingleFile ? dirname(opts.target) : opts.target;
+  const suppressedRules = opts.suppressedRules ?? loadSuppressedRules(dir);
 
   // Resolve content-sanity config once for this lint run (D1: lift DB
   // config when reachable). Caller can pre-pass via opts.contentSanity
   // (tests, Minion handler) to bypass the engine probe entirely.
   const contentSanity = opts.contentSanity ?? await resolveLintContentSanity(opts.engine);
-  const lintOpts: LintContentOpts = { contentSanity };
+  const lintOpts: LintContentOpts = { contentSanity, suppressedRules };
 
   let totalIssues = 0;
   let totalFixable = 0;
@@ -551,7 +747,8 @@ export async function runLint(args: string[]) {
   // aggregate. Sharing the resolved opts keeps both surfaces seeing
   // the same rule firings.
   const contentSanity = await resolveLintContentSanity();
-  const lintContentOpts: LintContentOpts = { contentSanity };
+  const suppressedRules = loadSuppressedRules(isSingleFile ? dirname(target) : target);
+  const lintContentOpts: LintContentOpts = { contentSanity, suppressedRules };
 
   for (const page of pages) {
     const content = readFileSync(page, 'utf-8');

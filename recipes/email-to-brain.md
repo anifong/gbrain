@@ -1,4 +1,7 @@
 ---
+title: Email To Brain
+type: note
+created: 2026-07-18
 id: email-to-brain
 name: Email-to-Brain
 version: 0.7.0

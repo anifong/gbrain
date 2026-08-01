@@ -1,4 +1,7 @@
 ---
+title: X To Brain
+type: note
+created: 2026-07-18
 id: x-to-brain
 name: X-to-Brain
 version: 0.8.1

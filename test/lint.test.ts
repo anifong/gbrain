@@ -88,6 +88,38 @@ describe('lintContent', () => {
     const issues = lintContent(content, 'test.md');
     expect(issues).toHaveLength(0);
   });
+
+  test('rule suppression: suppresses specified rules by path', () => {
+    const content = '---\ntitle: Test Page\ntype: person\ncreated: 2026-04-11\n---\n\n## Empty Section\n\n[No data yet]\n\nPlaceholder: YYYY-MM-DD';
+    const issues = lintContent(content, 'CHANGELOG.md', {
+      suppressedRules: {
+        'no-frontmatter': ['CHANGELOG.md'],
+        'placeholder-date': ['CHANGELOG.md'],
+        'empty-section': ['CHANGELOG.md'],
+      },
+    });
+    expect(issues).toHaveLength(0);
+  });
+
+  test('rule suppression: still fires for non-suppressed files', () => {
+    const content = 'Placeholder: YYYY-MM-DD';
+    const issues = lintContent(content, 'normal.md', {
+      suppressedRules: {
+        'placeholder-date': ['CHANGELOG.md'],
+      },
+    });
+    expect(issues.some(i => i.rule === 'placeholder-date')).toBe(true);
+  });
+
+  test('rule suppression: directory prefix matches files under it', () => {
+    const content = '---\ntype: concept\ncreated: 2026-04-11\n---\n\n# Test\ntemplate: YYYY-MM-DD';
+    const issues = lintContent(content, 'skills/migration.md', {
+      suppressedRules: {
+        'placeholder-date': ['skills/'],
+      },
+    });
+    expect(issues.filter(i => i.rule === 'placeholder-date')).toHaveLength(0);
+  });
 });
 
 describe('fixContent', () => {

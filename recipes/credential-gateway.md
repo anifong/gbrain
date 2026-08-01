@@ -1,4 +1,7 @@
 ---
+title: Credential Gateway
+type: note
+created: 2026-07-18
 id: credential-gateway
 name: Credential Gateway
 version: 0.7.0

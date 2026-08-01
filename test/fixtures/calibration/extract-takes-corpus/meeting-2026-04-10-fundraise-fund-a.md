@@ -1,4 +1,5 @@
 ---
+created: 2026-07-18
 title: "Fundraise office hours — fund-a + alice-example"
 type: meeting
 slug: meetings/2026-04-10-fundraise-fund-a

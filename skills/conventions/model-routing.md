@@ -1,3 +1,8 @@
+---
+title: model-routing
+type: note
+created: 2026-07-18
+---
 # Model Routing Convention
 
 Two distinct concerns share this name. Read both — they apply at different

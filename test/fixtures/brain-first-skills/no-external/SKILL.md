@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: no-external
 description: Skill that operates purely on local state
 triggers:

@@ -1,4 +1,7 @@
 ---
+title: Meeting Sync
+type: note
+created: 2026-07-18
 id: meeting-sync
 name: Meeting Sync
 version: 0.7.0

@@ -1,4 +1,5 @@
 ---
+created: 2026-07-18
 type: meeting
 title: Weekly Sync — March 28, 2025
 tags:

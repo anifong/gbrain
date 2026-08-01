@@ -1,4 +1,5 @@
 ---
+created: 2026-07-18
 title: alice-example
 type: people
 slug: people/alice-example

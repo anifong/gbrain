@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: strategic-reading
 version: 0.1.0
 description: Read a book, article, transcript, or case study through the lens of a specific strategic problem you're facing. Produces an applied playbook that maps the source onto the problem and gives short/medium/long-term recommendations. NOT for general book summaries.
@@ -166,7 +169,6 @@ Phase 5: Write and deliver
 - `skills/perplexity-research/SKILL.md` — current-intel cross-reference
   for fresh data
 - `skills/conventions/quality.md` — citation + back-link rules
-
 
 ## Contract
 

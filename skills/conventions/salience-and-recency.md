@@ -1,3 +1,8 @@
+---
+title: salience-and-recency
+type: note
+created: 2026-07-18
+---
 # Salience + Recency on `gbrain query` (v0.29.1)
 
 YOU ARE IN CHARGE of the `salience` and `recency` parameters on gbrain's

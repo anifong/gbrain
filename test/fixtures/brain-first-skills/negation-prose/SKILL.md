@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: negation-prose
 description: Skill where brain reference precedes a negation-prose mention
 triggers:

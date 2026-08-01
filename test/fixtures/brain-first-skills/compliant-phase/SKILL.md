@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: compliant-phase
 description: External-lookup skill with explicit Phase 1 brain heading
 triggers:

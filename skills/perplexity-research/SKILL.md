@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: perplexity-research
 version: 0.1.0
 description: Brain-augmented web research. Sends brain context about a topic to Perplexity, which searches the web with citations and returns what is NEW vs what the brain already knows. Use for entity enrichment, current-state checks, deal monitoring, and freshness deltas. NOT for simple URL fetches (use web_fetch) or brain-only queries (use gbrain query).
@@ -181,7 +184,6 @@ for news-cycle topics; omit for evergreen research.
   entity-enrichment loop
 - `skills/data-research/SKILL.md` — structured-data trackers (different
   shape: parameterized YAML recipes, not free-form research)
-
 
 ## Contract
 

@@ -1,3 +1,8 @@
+---
+title: brain-routing
+type: note
+created: 2026-07-18
+---
 # Brain Routing Convention
 
 Cross-cutting rules for which brain and which source an operation targets.

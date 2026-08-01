@@ -1,4 +1,7 @@
 ---
+title: Retrieval Reflex
+type: note
+created: 2026-07-18
 id: retrieval-reflex
 name: Retrieval Reflex
 version: 0.1.0

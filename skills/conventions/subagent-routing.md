@@ -1,3 +1,8 @@
+---
+title: subagent-routing
+type: note
+created: 2026-07-18
+---
 # Subagent Routing Convention
 
 How your agent decides between native subagents and GBrain Minions for

@@ -1,4 +1,5 @@
 ---
+created: 2026-07-18
 title: acme-example
 type: companies
 slug: companies/acme-example

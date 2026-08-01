@@ -1,3 +1,8 @@
+---
+title: calibration
+type: note
+created: 2026-07-18
+---
 # Convention: calibration loop (v0.36.1.0)
 
 The brain knows your track record and uses it. The calibration loop has

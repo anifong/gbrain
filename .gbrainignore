@@ -1,0 +1,68 @@
+# .gbrainignore — Lint/quality-check exclusions for this repository.
+#
+# gbrain lint intentionally checks ALL markdown files in its content scope,
+# including metafiles (README.md, AGENTS.md, CHANGELOG.md, etc.) that sync
+# would skip. However, this repo contains project scaffolding that is NOT
+# brain knowledge content and should not be subject to brain-page lint rules:
+#
+# - docs/           — project documentation (Docusaurus site)
+# - test/            — test fixtures and E2E scenarios (contain intentionally
+#                     broken/placeholder content by design)
+# - tests/           — test tooling, workloads, and fixtures
+# - evals/           — evaluation datasets and fixtures
+# - examples/        — example projects and templates
+# - recipes/         — recipe scaffolding (README.md, resolver files)
+# - dream-cycle-summaries/ — historical dream cycle artifacts
+# - admin/           — administrative scaffolding
+#
+# Directory patterns (trailing slash):
+docs/
+test/
+tests/
+evals/
+examples/
+recipes/
+dream-cycle-summaries/
+admin/
+
+# ── Rule-specific suppressions ─────────────────────────────
+#
+# Project metafiles intentionally lack YAML frontmatter — they are repo
+# documentation, not brain pages. Suppress `no-frontmatter` for known metafiles.
+# Format: rule:<rule-name>: <path-pattern>
+rule:no-frontmatter: AGENTS.md
+rule:no-frontmatter: CHANGELOG.md
+rule:no-frontmatter: CLAUDE.md
+rule:no-frontmatter: CONTRIBUTING.md
+rule:no-frontmatter: DESIGN.md
+rule:no-frontmatter: INSTALL_FOR_AGENTS.md
+rule:no-frontmatter: README.md
+rule:no-frontmatter: SECURITY.md
+rule:no-frontmatter: TODOS.md
+rule:no-frontmatter: skills/RESOLVER.md
+rule:no-frontmatter: skills/_AGENT_README.md
+rule:no-frontmatter: skills/_brain-filing-rules.md
+rule:no-frontmatter: skills/_friction-protocol.md
+rule:no-frontmatter: skills/_output-rules.md
+
+# CHANGELOG.md uses a release-notes format (## headers with prose bodies)
+# that the empty-section rule doesn't recognize as valid sections. Suppress
+# both empty-section and huge-page (it's a 2MB changelog — by design).
+rule:empty-section: CHANGELOG.md
+rule:huge-page: CHANGELOG.md
+
+# TODOS.md is a repo-level todo list, not a brain page.
+rule:huge-page: TODOS.md
+rule:empty-section: TODOS.md
+
+# Skill docs and conventions docs document file naming conventions using
+# YYYY-MM-DD format strings in their prose. The placeholder-date rule fires
+# on these, but they are intentional documentation of the format, not
+# unfilled placeholders. The root metafiles and all skills/ docs follow this.
+rule:placeholder-date: README.md
+rule:placeholder-date: CHANGELOG.md
+rule:placeholder-date: CLAUDE.md
+rule:placeholder-date: INSTALL_FOR_AGENTS.md
+rule:placeholder-date: skills/
+rule:placeholder-date: skills/_brain-filing-rules.md
+rule:placeholder-date: skills/_output-rules.md

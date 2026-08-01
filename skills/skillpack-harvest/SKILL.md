@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-22
 name: skillpack-harvest
 version: 0.33.0
 description: |

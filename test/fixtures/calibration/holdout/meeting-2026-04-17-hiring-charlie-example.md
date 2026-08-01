@@ -1,4 +1,5 @@
 ---
+created: 2026-07-18
 title: "Hiring conversation — charlie-example for acme-example COO role"
 type: meeting
 slug: meetings/2026-04-17-hiring-charlie-example

@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: retrieval-reflex
 version: 0.1.0
 description: When/what to retrieve — open the brain page for a salient entity before answering from memory.

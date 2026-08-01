@@ -1,4 +1,7 @@
 ---
+title: Calendar To Brain
+type: note
+created: 2026-07-18
 id: calendar-to-brain
 name: Calendar-to-Brain
 version: 0.7.0

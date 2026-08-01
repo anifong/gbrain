@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: voice-note-ingest
 version: 0.1.0
 description: Ingest a voice note with exact-phrasing preservation (never paraphrased). Routes content to originals/, concepts/, people/, companies/, ideas/, personal/, or voice-notes/ based on a decision tree. The user's exact words are the signal.
@@ -182,7 +185,6 @@ No batching.
   text-channel idea capture
 - `skills/idea-ingest/SKILL.md` — for typed-text idea ingestion
 - `skills/conventions/quality.md` — citation + back-link rules
-
 
 ## Contract
 

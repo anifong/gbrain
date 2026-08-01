@@ -1,4 +1,7 @@
 ---
+title: Restart Sweep
+type: note
+created: 2026-07-18
 id: restart-sweep
 name: Restart Sweep
 version: 0.1.0

@@ -1,4 +1,5 @@
 ---
+created: 2026-07-18
 type: meeting
 title: NovaMind — YC W25 Demo Day
 tags:

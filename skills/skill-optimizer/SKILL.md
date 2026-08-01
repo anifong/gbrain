@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: skill-optimizer
 version: 0.1.0
 description: Self-evolving skill optimization via SkillOpt-paper-grounded text-space optimizer.

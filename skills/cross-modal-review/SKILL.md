@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: cross-modal-review
 version: 1.1.0
 description: |

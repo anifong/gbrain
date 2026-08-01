@@ -1,4 +1,7 @@
 ---
+title: Agent Voice
+type: note
+created: 2026-07-18
 id: agent-voice
 name: Voice Personas (Mars + Venus)
 version: 0.1.0

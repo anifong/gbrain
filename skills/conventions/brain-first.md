@@ -1,3 +1,8 @@
+---
+title: brain-first
+type: note
+created: 2026-07-18
+---
 # Brain-First Lookup Convention
 
 **Read this before doing ANY entity/person/company/fact lookup.**

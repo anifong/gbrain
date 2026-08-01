@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: briefing
 description: Compile daily briefing with meeting context, active deals, and citation tracking
 triggers:

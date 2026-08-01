@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: brain-ops
 description: Read, enrich, and write brain pages with source attribution.
 triggers:

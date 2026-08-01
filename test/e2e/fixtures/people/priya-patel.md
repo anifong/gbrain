@@ -1,4 +1,5 @@
 ---
+created: 2026-07-18
 type: person
 title: Priya Patel
 tags:

@@ -1,3 +1,8 @@
+---
+title: cron-via-minions
+type: note
+created: 2026-07-18
+---
 # Cron via Minions Convention
 
 How cron-scheduled agent work is dispatched in a GBrain-backed install.

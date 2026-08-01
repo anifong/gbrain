@@ -1,3 +1,8 @@
+---
+title: quality
+type: note
+created: 2026-07-18
+---
 # Quality Convention
 
 Cross-cutting quality rules for all brain-writing skills.

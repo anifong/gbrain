@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: smoke-test
 description: |
   Post-restart smoke tests + auto-fix for gbrain and OpenClaw environments.

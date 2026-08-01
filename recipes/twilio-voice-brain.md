@@ -1,4 +1,7 @@
 ---
+title: Twilio Voice Brain
+type: note
+created: 2026-07-18
 id: twilio-voice-brain
 name: Voice-to-Brain (DEPRECATED — see agent-voice)
 version: 0.8.2

@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: migrate
 description: Universal migration from Obsidian, Notion, Logseq, markdown, CSV, JSON, Roam
 triggers:

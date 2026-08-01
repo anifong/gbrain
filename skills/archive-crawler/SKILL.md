@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: archive-crawler
 version: 0.1.0
 description: Universal archivist for personal file archives (Dropbox/B2/Gmail-takeout/local-mount/hard-drive-dump). Filters for high-value content (the user's own writing, ideas, relationships) and surfaces it interactively. REFUSES TO RUN without an explicit gbrain.yml `archive-crawler.scan_paths:` allow-list.
@@ -302,7 +305,6 @@ scan_paths: ["paths from gbrain.yml"]
 - `skills/idea-ingest/SKILL.md` — single-link-or-article ingest with
   the same primary-subject filing rule
 - `skills/conventions/quality.md` — citations, back-links, voice
-
 
 ## Contract
 

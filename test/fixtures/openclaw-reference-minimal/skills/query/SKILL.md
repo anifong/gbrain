@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: query
 description: Look up brain pages in the OpenClaw reference fixture.
 triggers:

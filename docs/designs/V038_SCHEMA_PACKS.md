@@ -1,4 +1,7 @@
 ---
+title: V038 SCHEMA PACKS
+type: note
+created: 2026-07-18
 status: ACTIVE
 ---
 # CEO Plan: v0.38 Schema Packs — Bring Your Own Shape

@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: concept-synthesis
 version: 0.1.0
 description: Deduplicate and synthesize raw concept stubs into a tiered intellectual map (T1 Canon to T4 Riff), tracing idea evolution across sources over time. Transforms thousands of raw concept pages into a curated intellectual fingerprint.
@@ -237,7 +240,6 @@ This is heavy work. Run on a cadence, not on every signal:
 - `skills/signal-detector/SKILL.md` — creates raw concept stubs from text channels
 - `skills/voice-note-ingest/SKILL.md` — same for audio channels
 - `skills/idea-ingest/SKILL.md` — same for links / articles
-
 
 ## Contract
 

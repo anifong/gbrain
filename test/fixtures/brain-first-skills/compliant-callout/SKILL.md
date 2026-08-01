@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: compliant-callout
 description: External-lookup skill with canonical Convention callout
 triggers:

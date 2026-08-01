@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: cron-scheduler
 version: 1.0.0
 description: |

@@ -1,3 +1,8 @@
+---
+title: schema-evolution
+type: note
+created: 2026-07-18
+---
 # Convention: schema evolution — when to add a type vs alias vs prefix
 
 Cross-cutting convention for any skill that proposes a change to the

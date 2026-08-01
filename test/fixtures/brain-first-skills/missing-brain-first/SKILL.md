@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: missing-brain-first
 description: External-lookup skill with NO brain-first compliance
 triggers:

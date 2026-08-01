@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: publish
 description: Share brain pages as beautiful password-protected HTML with zero LLM calls
 triggers:

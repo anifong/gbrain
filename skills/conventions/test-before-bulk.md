@@ -1,3 +1,8 @@
+---
+title: test-before-bulk
+type: note
+created: 2026-07-18
+---
 # Test Before Bulk Convention
 
 Never run a batch operation without testing one first.

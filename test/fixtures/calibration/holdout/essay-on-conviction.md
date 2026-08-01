@@ -1,4 +1,5 @@
 ---
+created: 2026-07-18
 title: "On conviction"
 type: essay
 slug: writing/on-conviction

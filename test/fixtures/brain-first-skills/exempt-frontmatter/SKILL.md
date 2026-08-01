@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: exempt-frontmatter
 description: Pure-infra skill that opts out via frontmatter
 triggers:

@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: book-mirror
 version: 0.1.0
 description: Take any book (EPUB/PDF), produce a personalized chapter-by-chapter analysis with two-column tables. Left column preserves the chapter content; right column maps every idea to the reader's actual life using brain context. Output is a single brain page at media/books/<slug>-personalized.md plus an optional PDF via brain-pdf.

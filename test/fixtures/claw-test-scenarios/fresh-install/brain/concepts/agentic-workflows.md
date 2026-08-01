@@ -1,4 +1,6 @@
 ---
+title: Agentic Workflows
+created: 2026-07-18
 type: concept
 name: Agentic Workflows
 ---

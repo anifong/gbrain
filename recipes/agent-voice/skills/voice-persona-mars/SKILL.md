@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: voice-persona-mars
 version: 0.1.0
 description: Route to Mars (introspective thought partner / demo showman voice persona). Used when the operator wants depth, meaning, or impressive social demos rather than logistics. Mars handles SOLO mode (philosophy, presence, patterns) and DEMO mode (tool-driven showmanship) automatically.

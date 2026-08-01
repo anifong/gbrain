@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: typo-frontmatter
 description: Skill with typo in brain_first declaration
 triggers:

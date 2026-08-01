@@ -1,4 +1,7 @@
 ---
+title: SKILL
+type: note
+created: 2026-07-18
 name: academic-verify
 version: 0.1.0
 description: Verify a research claim or academic citation by tracing it through publication → methodology → raw data → independent replication. Routes through perplexity-research for the actual web lookup, then formats results as a citation-checked brain page. Use when a book/article/conversation cites a study and you want to confirm the claim is real, replicated, and accurately characterized.
@@ -207,7 +210,6 @@ doesn't, the trace speaks for itself.
 - `skills/citation-fixer/SKILL.md` — fixes citation FORMATTING; this
   skill checks whether the cited claim is true
 - `skills/conventions/quality.md` — citation + back-link rules
-
 
 ## Contract
 

@@ -1,4 +1,6 @@
 ---
+title: Acme Example
+created: 2026-07-18
 type: company
 name: Acme Example
 founded: 2024
